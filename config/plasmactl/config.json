@@ -1,0 +1,96 @@
+{
+  "version": "0.4.2",
+  "drm": {
+    "device": "auto",
+    "auto_fallback": true,
+    "driver_order": [
+      "i915",
+      "xe",
+      "amdgpu"
+    ],
+    "require_driver": "",
+    "gpu_default": "igpu",
+    "gpu_allow_fallback": false,
+    "gpu_roles": {
+      "igpu": {
+        "drivers": [
+          "i915",
+          "xe"
+        ]
+      },
+      "dgpu": {
+        "drivers": [
+          "amdgpu",
+          "nvidia",
+          "nouveau"
+        ]
+      }
+    },
+    "forbid_drivers": [],
+    "require_connected_output_on_start": true,
+    "allow_vkms": false
+  },
+  "headless": {
+    "mode": "kernel-forced-edid",
+    "force_output": "HDMI-A-1",
+    "force_mode": "1920x1080@60",
+    "edid_file": "white_1080p.bin"
+  },
+  "tty": {
+    "activate_on_start": true,
+    "require_active_on_start": true
+  },
+  "stop": {
+    "lock_tmux": true,
+    "kill_tmux": false,
+    "terminate_tty_session": false,
+    "return_tty": true,
+    "return_tty_name": "tty2"
+  },
+  "sunshine": {
+    "profile": "performance",
+    "start_mode": "systemd-run",
+    "supervise": false,
+    "systemd": {
+      "unit_prefix": "sunshine-plasmactl",
+      "isolate_dri": true,
+      "require_cap_sys_admin": true,
+      "device_allow_uinput": true,
+      "assert_mode": "journal",
+      "fd_assert_strict": false
+    },
+    "adapter": {
+      "mode": "auto",
+      "name": ""
+    },
+    "output": {
+      "mode": "disabled",
+      "name": ""
+    },
+    "strict_gpu_assert": false,
+    "igpu_libva_driver_name": "iHD",
+    "dgpu_libva_driver_name": ""
+  },
+  "profiles": {
+    "performance": {
+      "encoder": "vaapi",
+      "capture": "kms",
+      "max_bitrate": 20000,
+      "qp": 14,
+      "fec_percentage": 5,
+      "fps_target": 60,
+      "hevc_mode": 1,
+      "av1_mode": 1,
+      "min_threads": 2,
+      "vaapi_strict_rc_buffer": "disabled"
+    },
+    "safe": {
+      "encoder": "software",
+      "capture": "kms",
+      "max_bitrate": 30000,
+      "qp": 23,
+      "fec_percentage": 20,
+      "fps_target": 60
+    }
+  }
+}

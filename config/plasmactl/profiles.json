@@ -1,0 +1,37 @@
+{
+  "version": "0.4.2",
+  "active_profile": "performance",
+  "architecture": "Plasma/KWin runs on tty2/tmux. Sunshine runs via transient systemd-run with DevicePolicy=closed and DeviceAllow for only the selected GPU.",
+  "confirmation_commands": [
+    "plasmactl confirm-gpu igpu",
+    "plasmactl confirm-gpu dgpu",
+    "plasmactl confirm-igpu",
+    "plasmactl confirm-dgpu"
+  ],
+  "profiles": {
+    "safe": {
+      "sunshine_config": "~/.config/sunshine/plasmactl-safe.conf",
+      "apps_json": "~/.config/sunshine/plasmactl-apps-safe.json",
+      "resolution_target": "1920x1080",
+      "fps_target": 60,
+      "encoder": "software",
+      "capture": "kms",
+      "max_bitrate_kbps": 30000,
+      "codec_policy": "H.264/software fallback profile"
+    },
+    "performance": {
+      "sunshine_config": "~/.config/sunshine/plasmactl-performance.conf",
+      "apps_json": "~/.config/sunshine/plasmactl-apps-performance.json",
+      "resolution_target": "1920x1080 or client-requested",
+      "fps_target": 60,
+      "encoder": "vaapi",
+      "capture": "kms",
+      "max_bitrate_kbps": 20000,
+      "qp": 14,
+      "fec_percentage": 5,
+      "hevc_mode": 1,
+      "av1_mode": 1,
+      "codec_policy": "Validated iGPU baseline: H.264 VAAPI, HEVC/AV1 disabled for stability on UHD 630"
+    }
+  }
+}

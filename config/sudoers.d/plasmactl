@@ -1,0 +1,1 @@
+whitedwarf ALL=(root) NOPASSWD: /usr/bin/chvt, /usr/bin/loginctl, /usr/bin/systemctl, /usr/bin/systemd-run, /usr/bin/journalctl

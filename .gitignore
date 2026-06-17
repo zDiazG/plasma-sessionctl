@@ -1,0 +1,29 @@
+# Runtime / generated debug state
+.cache/
+*.log
+*.pid
+*.lock
+*.tmp
+*.bak
+*.bak.*
+*.old
+*.orig
+*.swp
+*~
+
+# Local release artifacts; prefer GitHub Releases later
+dist/
+*.tar.gz
+*.zip
+
+# Sunshine/private runtime secrets - never commit
+**/credentials/
+**/sunshine_state.json
+**/cacert.pem
+**/cakey.pem
+*.pem
+
+# Local editor/OS
+.vscode/
+.idea/
+.DS_Store
