@@ -1,6 +1,6 @@
-# plasma-sessionctl / plasmactl v0.4.2 baseline
-# Target host: WhiteDwarf, KDE Plasma Wayland + Sunshine + Moonlight.
-# Runtime config source: ~/.config/plasmactl.conf. JSON overlay is optional.
+# plasma-sessionctl / plasmactl v0.4.3 configuration baseline
+# Target: KDE Plasma Wayland + Sunshine + Moonlight headless/isolated session manager.
+# Runtime config source: ~/.config/plasmactl.conf. JSON overlay (~/.config/plasmactl/config.json) is optional.
 
 PLASMA_GPU_DEFAULT=igpu
 PLASMA_GPU_ALLOW_FALLBACK=false
@@ -17,7 +17,7 @@ ALLOW_VKMS=false
 HEADLESS_MODE=kernel-forced-edid
 HEADLESS_FORCE_OUTPUT=HDMI-A-1
 HEADLESS_FORCE_MODE=1920x1080@60
-HEADLESS_EDID_FILE=white_1080p.bin
+HEADLESS_EDID_FILE=edid_1080p.bin
 REQUIRE_CONNECTED_OUTPUT_ON_START=true
 
 ACTIVATE_TTY_ON_START=true
@@ -30,7 +30,10 @@ TERMINATE_TTY_SESSION_ON_STOP=false
 RETURN_TTY_ON_STOP=true
 RETURN_TTY_NAME=tty2
 
-# v0.4.x: Plasma/KWin runs in tty2/tmux; Sunshine runs as a transient systemd-run unit.
+# Sunshine session startup mode:
+# - systemd-run: Transient root unit with DeviceAllow cgroup isolation (Recommended)
+# - tmux: Foreground window inside target tmux session
+# - systemd: Standard user systemd service
 SUNSHINE_START_MODE=systemd-run
 SUNSHINE_SYSTEMD_ISOLATE_DRI=true
 SUNSHINE_SYSTEMD_UNIT_PREFIX=sunshine-plasmactl
@@ -43,10 +46,11 @@ SUNSHINE_PROFILE=performance
 SUNSHINE_SUPERVISE=false
 SUNSHINE_RESTART_ON_START=true
 SUNSHINE_REQUIRED_TCP_PORTS="47990 48010"
+SUNSHINE_TCP_PORTS="47984 47989 47990 48010"
+SUNSHINE_UDP_PORTS="47998 47999 48000 48010"
 SUNSHINE_ARGS=
 
-# In systemd-run isolation mode, do not set adapter_name/output_name.
-# The non-selected GPU is blocked by DevicePolicy/DeviceAllow.
+# Sunshine GPU render adapter & output selection
 SUNSHINE_ADAPTER_MODE=auto
 SUNSHINE_ADAPTER_NAME=
 SUNSHINE_OUTPUT_MODE=disabled
@@ -56,8 +60,7 @@ SUNSHINE_STRICT_GPU_ASSERT=false
 SUNSHINE_IGPU_LIBVA_DRIVER_NAME=iHD
 SUNSHINE_DGPU_LIBVA_DRIVER_NAME=
 
-# Conservative iGPU baseline validated on UHD 630: H.264 VAAPI, 20 Mbps ceiling.
-# Moonlight may request its own bitrate; this keeps first-launch behavior stable.
+# Performance Profile parameters (hardware acceleration on iGPU)
 SUNSHINE_PERF_ENCODER=vaapi
 SUNSHINE_PERF_CAPTURE=kms
 SUNSHINE_PERF_MAX_BITRATE=20000
@@ -69,6 +72,7 @@ SUNSHINE_PERF_AV1_MODE=1
 SUNSHINE_PERF_MIN_THREADS=2
 SUNSHINE_PERF_VAAPI_STRICT_RC_BUFFER=disabled
 
+# Safe Fallback Profile parameters (software encoder for diagnostic isolation)
 SUNSHINE_SAFE_ENCODER=software
 SUNSHINE_SAFE_CAPTURE=kms
 SUNSHINE_SAFE_MAX_BITRATE=30000

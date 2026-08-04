@@ -1,1 +1,5 @@
-whitedwarf ALL=(root) NOPASSWD: /usr/bin/chvt, /usr/bin/loginctl, /usr/bin/systemctl, /usr/bin/systemd-run, /usr/bin/journalctl
+# plasmactl — Sudoers permissions snippet for physical TTY switching and transient units
+# Copy to /etc/sudoers.d/plasmactl and replace <USERNAME> with your Linux desktop username.
+# Secure permissions: sudo chmod 0440 /etc/sudoers.d/plasmactl
+
+<USERNAME> ALL=(root) NOPASSWD: /usr/bin/chvt, /usr/bin/loginctl, /usr/bin/systemctl, /usr/bin/systemd-run, /usr/bin/journalctl
