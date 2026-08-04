@@ -1,103 +1,31 @@
 #!/usr/bin/env bash
+#
 # plasmactl — KDE Plasma Wayland + Sunshine session controller
 # Architecture: getty@tty2 → autologin → tmux plasma → startplasma-wayland → Sunshine
-# Version: 0.4.2
+# License: GPL-3.0-or-later
+# Version: 0.4.3
 #
-# v0.2.4 design changes:
-# - VKMS is optional, not a hard requirement.
-# - Prefer a real iGPU DRM card for KWin (i915/xe first), with config override.
-# - Stop/restart Sunshine around Plasma start so it does not grab KMS too early.
-# - Wait for kwin + WAYLAND_DISPLAY socket + plasmashell before starting Sunshine.
-# - Use systemctl --user set-environment so Sunshine inherits Wayland/runtime hints.
-# - Avoid fragile pgrep|head pipelines under set -euo pipefail.
+# Copyright (C) 2026 plasmactl contributors
 #
-# v0.2.5 hotfix:
-# - Fix doctor unbound variable on local cn/cd assignment under set -u.
-# - Warn when VKMS/faux is still present while ALLOW_VKMS=false, because Sunshine may still select it for KMS capture.
-# - After Sunshine start, inspect fresh journal lines and warn if Sunshine chose VKMS/faux for capture.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
 #
-# v0.2.6 changes:
-# - Sunshine health is process + TCP listener validation, not only systemd active.
-# - Default Sunshine launcher changed to tmux window inside the real tty2 session.
-#   This matches the confirmed working manual foreground launch and bypasses the user service
-#   crash/start-limit-hit path seen with signal=TRAP.
-# - systemd Sunshine service is stopped/reset before tmux launch to avoid port/process conflicts.
-# - status/doctor/logs/debug now show listeners and tmux Sunshine log.
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
 #
-# v0.2.7 hotfix:
-# - Fix broken tmux Sunshine launcher quoting that caused line 714 command injection.
-# - Generate a dedicated launcher script in ~/.local/state/plasmactl/ and run that from tmux.
-# - Keep Sunshine considered healthy only after PID + required TCP listeners are up.
-#
-# v0.2.8 regression:
-# - Attempted SUNSHINE_ARGS=--cmd, but this Sunshine build treats cmd as an unknown command and exits rc=7.
-#
-# v0.2.9 hotfix:
-# - Revert default Sunshine launch to plain /usr/bin/sunshine, the last known listener-good mode.
-# - Keep SUNSHINE_ARGS config knob, but auto-ignore --cmd/--no-tray style args that break this build.
-# - This version is a stable automation baseline; it does not claim to solve the later Initial Ping Timeout.
-#
-# v0.3.0 changes:
-# - Adds a Sunshine SAFE profile to isolate stream failures from user config.
-# - SAFE profile disables tray/notifications, disables HEVC/AV1 advertisement, caps bitrate, and uses software H.264 first.
-# - SAFE profile uses a clean apps file without xrandr/prep commands.
-# - Adds an optional tmux supervisor loop to auto-restart Sunshine after SIGTRAP/crash so the host does not stay offline.
-# - Adds sunshine-safe and config-snapshot commands for repeatable diagnosis.
-#
-# v0.3.1 hotfix:
-# - Activates the real tty2/seat0 session before launching Plasma so KMS capture does not stream tty1/getty.
-# - Adds active VT/session diagnostics to status/doctor/list.
-# - Supports loginctl activate first, with optional sudo chvt fallback.
-#
-# v0.3.2 changes:
-# - Stop can lock the attached tmux session and optionally switch back to an idle/locked VT.
-# - Adds safe and performance Sunshine profile generation with centralized plasmactl profile manifest.
-# - Adds optional setup/firstrun helper for fresh installs.
-# - Keeps v0.3.1 start path intact; no change to the working KMS/tty2 activation flow.
-#
-# v0.3.6 changes:
-# - Adds optional JSON overlay config for repo-friendly deployments: ~/.config/plasmactl/config.json.
-# - Adds explicit DRM driver ordering/requirement knobs so headless EDID can be pinned to iGPU or allowed to fall back to dGPU.
-# - Aligns Sunshine adapter_name with the selected DRM card render node by default, avoiding stale adapter_name from old Sunshine configs.
-# - Adds headless-edid install-limine helper for CachyOS/Limine forced-EDID deployment.
-#
-# v0.3.7 changes:
-# - Adds explicit GPU role selection: igpu/dgpu/auto with default iGPU for this use case.
-# - Adds --gpu=igpu|dgpu|auto, --igpu, --dgpu start overrides without editing config.
-# - Enforces iGPU-only/dGPU-only role when fallback is disabled, preventing silent use of the wrong GPU.
-# - Adds gpu-assert to verify selected DRM/render/driver and running KWin/Sunshine GPU alignment.
-# - Adds config-template and sanity commands for repo bootstrap and post-boot validation.
-#
-# v0.3.8 hotfix:
-# - Adds Sunshine output_name pinning so KMS capture follows the selected KWin/Wayland output instead of a connected dGPU dummy.
-# - Adds strict Sunshine GPU log assertion; iGPU mode fails if Sunshine captures/encodes on AMD.
-# - Exports LIBVA_DRIVER_NAME=iHD for iGPU runs by default, configurable.
-#
-# v0.4.0 architecture:
-# - Keeps Plasma/KWin in the tty2/tmux session, but runs Sunshine via transient root systemd-run by default.
-# - Uses DevicePolicy=closed + DeviceAllow for the selected card/render node so Sunshine cannot capture the wrong GPU.
-# - Grants the transient Sunshine unit the KMS/capture capability path that worked on i915 headless.
-# - Default GPU remains iGPU; --dgpu/--igpu still override per start/restart/sanity.
-#
-# v0.4.1 hotfix:
-# - Do not kill a working transient Sunshine unit because the initial /proc fd assert runs before first launch/capture.
-# - Default systemd-run assertion mode is journal/soft; selected-GPU proof comes from Sunshine KMS/VAAPI journal lines.
-# - Keep FD checks as diagnostics/warnings unless SUNSHINE_SYSTEMD_ASSERT_MODE=strict.
-#
-# v0.4.2 consolidation:
-# - Adds confirm-gpu/confirm-igpu/confirm-dgpu for runtime proof tagged as confirm:igpu or confirm:dgpu.
-# - Lists KWin/Sunshine DRM fds and visible processes using each selected GPU.
-# - Fixes stray warn() call from v0.4.1 and rejects common typo -dgpu/-igpu with a clear message.
-# - Updates config-template defaults for systemd-run isolation and H.264-only iGPU baseline.
 
 set -euo pipefail
 
-VERSION="0.4.2"
+VERSION="0.4.3"
 VERBOSE=false
 FIX_MODE=false
 
 # ─────────────────────────────────────────────────────────────────────────────
-# USER CONTEXT
+# USER CONTEXT & PRIVILEGE WRAPPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 if [[ -n "${SUDO_USER:-}" ]]; then
@@ -110,8 +38,40 @@ fi
 REAL_UID="$(id -u "${REAL_USER}" 2>/dev/null || echo "${UID}")"
 RUNTIME_DIR="/run/user/${REAL_UID}"
 
+# Binary paths with fallback resolution to prevent hardcoded path assumptions across distros
+CHVT_BIN="${CHVT_BIN:-$(command -v chvt 2>/dev/null || echo /usr/bin/chvt)}"
+LOGINCTL_BIN="${LOGINCTL_BIN:-$(command -v loginctl 2>/dev/null || echo /usr/bin/loginctl)}"
+SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-$(command -v systemctl 2>/dev/null || echo /usr/bin/systemctl)}"
+SUNSHINE_BIN="${SUNSHINE_BIN:-$(command -v sunshine 2>/dev/null || echo /usr/bin/sunshine)}"
+TMUX_BIN="${TMUX_BIN:-$(command -v tmux 2>/dev/null || echo /usr/bin/tmux)}"
+
+# Run user-space tools under REAL_USER context when script runs as root
+_run_as_user() {
+    if [[ "${EUID}" -eq 0 ]]; then
+        sudo -u "${REAL_USER}" "$@"
+    else
+        "$@"
+    fi
+}
+
+_sudo() {
+    if sudo -n true 2>/dev/null; then
+        sudo -n "$@"
+    else
+        return 1
+    fi
+}
+
+_priv() {
+    if [[ "${EUID}" -eq 0 ]]; then
+        "$@"
+    else
+        _sudo "$@"
+    fi
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIG
+# CONFIG & DEFAULTS
 # ─────────────────────────────────────────────────────────────────────────────
 
 CONFIG_DIR="${REAL_HOME}/.config"
@@ -126,8 +86,7 @@ ACTIVATE_TTY_ON_START="${ACTIVATE_TTY_ON_START:-true}"
 REQUIRE_ACTIVE_TTY_ON_START="${REQUIRE_ACTIVE_TTY_ON_START:-true}"
 TTY_ACTIVATE_TIMEOUT="${TTY_ACTIVATE_TIMEOUT:-8}"
 
-# Stop/idle security behavior. Defaults are conservative: lock the visible tmux client,
-# do not kill the main tty2 tmux session unless explicitly requested.
+# Stop/idle security behavior.
 LOCK_TMUX_ON_STOP="${LOCK_TMUX_ON_STOP:-true}"
 KILL_TMUX_ON_STOP="${KILL_TMUX_ON_STOP:-false}"
 TERMINATE_TTY_SESSION_ON_STOP="${TERMINATE_TTY_SESSION_ON_STOP:-false}"
@@ -136,47 +95,44 @@ RETURN_TTY_NAME="${RETURN_TTY_NAME:-${TTY_NAME}}"
 STOP_TTY_ACTIVATE_TIMEOUT="${STOP_TTY_ACTIVATE_TIMEOUT:-5}"
 SUNSHINE_UNIT="${SUNSHINE_UNIT:-app-dev.lizardbyte.app.Sunshine.service}"
 PLASMA_DRM_DEVICE="${PLASMA_DRM_DEVICE:-auto}"      # auto | /dev/dri/cardN
-PLASMA_DRM_DEVICE_AUTO_FALLBACK="${PLASMA_DRM_DEVICE_AUTO_FALLBACK:-true}" # if configured card disappears, auto-detect instead of hard failing
-PLASMA_DRM_DRIVER_ORDER="${PLASMA_DRM_DRIVER_ORDER:-i915 xe amdgpu}" # auto-detect order; set amdgpu first if forced EDID lands on dGPU
-PLASMA_DRM_REQUIRE_DRIVER="${PLASMA_DRM_REQUIRE_DRIVER:-}" # optional hard pin: i915|xe|amdgpu
-# GPU role policy. Default is iGPU because this host should keep the dGPU free/unused for this session.
-# Override one run with: plasmactl --gpu=dgpu start  OR  plasmactl --dgpu start
+PLASMA_DRM_DEVICE_AUTO_FALLBACK="${PLASMA_DRM_DEVICE_AUTO_FALLBACK:-true}"
+PLASMA_DRM_DRIVER_ORDER="${PLASMA_DRM_DRIVER_ORDER:-i915 xe amdgpu}"
+PLASMA_DRM_REQUIRE_DRIVER="${PLASMA_DRM_REQUIRE_DRIVER:-}"
+
 PLASMA_GPU_DEFAULT="${PLASMA_GPU_DEFAULT:-igpu}"        # igpu | dgpu | auto
-PLASMA_GPU_OVERRIDE="${PLASMA_GPU_OVERRIDE:-}"          # runtime only; normally set by --gpu/--igpu/--dgpu
-PLASMA_GPU_ALLOW_FALLBACK="${PLASMA_GPU_ALLOW_FALLBACK:-false}" # false = never silently fall back to another GPU role
+PLASMA_GPU_OVERRIDE="${PLASMA_GPU_OVERRIDE:-}"          # runtime override
+PLASMA_GPU_ALLOW_FALLBACK="${PLASMA_GPU_ALLOW_FALLBACK:-false}"
 PLASMA_GPU_IGPU_DRIVERS="${PLASMA_GPU_IGPU_DRIVERS:-i915 xe}"
 PLASMA_GPU_DGPU_DRIVERS="${PLASMA_GPU_DGPU_DRIVERS:-amdgpu nvidia nouveau}"
 PLASMA_GPU_FORBID_DRIVERS="${PLASMA_GPU_FORBID_DRIVERS:-}"
-ALLOW_VKMS="${ALLOW_VKMS:-false}"                  # true only if you explicitly want VKMS fallback
-HEADLESS_MODE="${HEADLESS_MODE:-none}"              # none | kernel-forced-edid | vkms (diagnostic label only)
+ALLOW_VKMS="${ALLOW_VKMS:-false}"
+HEADLESS_MODE="${HEADLESS_MODE:-none}"              # none | kernel-forced-edid | vkms
 HEADLESS_FORCE_OUTPUT="${HEADLESS_FORCE_OUTPUT:-HDMI-A-1}"
 HEADLESS_FORCE_MODE="${HEADLESS_FORCE_MODE:-1920x1080@60}"
-HEADLESS_EDID_FILE="${HEADLESS_EDID_FILE:-white_1080p.bin}"
-REQUIRE_CONNECTED_OUTPUT_ON_START="${REQUIRE_CONNECTED_OUTPUT_ON_START:-true}" # fail early if selected DRM has no connected KMS connector
+HEADLESS_EDID_FILE="${HEADLESS_EDID_FILE:-edid_1080p.bin}"
+REQUIRE_CONNECTED_OUTPUT_ON_START="${REQUIRE_CONNECTED_OUTPUT_ON_START:-true}"
 SUNSHINE_RESTART_ON_START="${SUNSHINE_RESTART_ON_START:-true}"
 SUNSHINE_START_MODE="${SUNSHINE_START_MODE:-systemd-run}"      # systemd-run | tmux | systemd | auto
-SUNSHINE_ARGS="${SUNSHINE_ARGS-}"                  # default empty; --cmd is unsupported by this Sunshine build
-SUNSHINE_PROFILE="${SUNSHINE_PROFILE:-safe}"               # normal | safe | performance
-SUNSHINE_CONFIG_PATH="${SUNSHINE_CONFIG_PATH:-}"           # explicit Sunshine config file; overrides profile
+SUNSHINE_ARGS="${SUNSHINE_ARGS:-}"
+SUNSHINE_PROFILE="${SUNSHINE_PROFILE:-safe}"               # safe | performance | normal
+SUNSHINE_CONFIG_PATH="${SUNSHINE_CONFIG_PATH:-}"
 SUNSHINE_ADAPTER_MODE="${SUNSHINE_ADAPTER_MODE:-auto}" # auto|selected|preserve|path|disabled
-SUNSHINE_ADAPTER_NAME="${SUNSHINE_ADAPTER_NAME:-}"         # explicit adapter_name when SUNSHINE_ADAPTER_MODE=path or non-empty override
-# Sunshine can choose the wrong KMS card when both iGPU and dGPU have connected outputs.
-# output_name is a Sunshine display id; with this tmux/KWin architecture the selected compositor output is normally id 0.
+SUNSHINE_ADAPTER_NAME="${SUNSHINE_ADAPTER_NAME:-}"
 SUNSHINE_OUTPUT_MODE="${SUNSHINE_OUTPUT_MODE:-disabled}"   # selected|preserve|path|disabled
-SUNSHINE_OUTPUT_NAME="${SUNSHINE_OUTPUT_NAME:-}"           # Sunshine output_name id/name; disabled by default
-SUNSHINE_STRICT_GPU_ASSERT="${SUNSHINE_STRICT_GPU_ASSERT:-false}" # opt-in fail if Sunshine logs show capture/encode on the wrong GPU
-SUNSHINE_IGPU_LIBVA_DRIVER_NAME="${SUNSHINE_IGPU_LIBVA_DRIVER_NAME:-iHD}" # Gen9+ Intel VAAPI driver for systemd-run iGPU mode
-SUNSHINE_DGPU_LIBVA_DRIVER_NAME="${SUNSHINE_DGPU_LIBVA_DRIVER_NAME:-}" # empty lets Mesa pick AMD radeonsi when dGPU is selected
+SUNSHINE_OUTPUT_NAME="${SUNSHINE_OUTPUT_NAME:-}"
+SUNSHINE_STRICT_GPU_ASSERT="${SUNSHINE_STRICT_GPU_ASSERT:-false}"
+SUNSHINE_IGPU_LIBVA_DRIVER_NAME="${SUNSHINE_IGPU_LIBVA_DRIVER_NAME:-iHD}"
+SUNSHINE_DGPU_LIBVA_DRIVER_NAME="${SUNSHINE_DGPU_LIBVA_DRIVER_NAME:-}"
 SUNSHINE_SYSTEMD_UNIT_PREFIX="${SUNSHINE_SYSTEMD_UNIT_PREFIX:-sunshine-plasmactl}"
 SUNSHINE_SYSTEMD_ISOLATE_DRI="${SUNSHINE_SYSTEMD_ISOLATE_DRI:-true}"
 SUNSHINE_SYSTEMD_REQUIRE_CAP_SYS_ADMIN="${SUNSHINE_SYSTEMD_REQUIRE_CAP_SYS_ADMIN:-true}"
 SUNSHINE_SYSTEMD_DEVICE_ALLOW_UINPUT="${SUNSHINE_SYSTEMD_DEVICE_ALLOW_UINPUT:-true}"
 SUNSHINE_SYSTEMD_ASSERT_MODE="${SUNSHINE_SYSTEMD_ASSERT_MODE:-journal}" # off|journal|strict
 SUNSHINE_SYSTEMD_FD_ASSERT_STRICT="${SUNSHINE_SYSTEMD_FD_ASSERT_STRICT:-false}"
-SUNSHINE_SUPERVISE="${SUNSHINE_SUPERVISE:-true}"           # restart Sunshine after crash inside tmux launcher
-SUNSHINE_SUPERVISE_MAX_RESTARTS="${SUNSHINE_SUPERVISE_MAX_RESTARTS:-5}"  # 0 = unlimited
+SUNSHINE_SUPERVISE="${SUNSHINE_SUPERVISE:-true}"
+SUNSHINE_SUPERVISE_MAX_RESTARTS="${SUNSHINE_SUPERVISE_MAX_RESTARTS:-5}"
 SUNSHINE_SUPERVISE_RESTART_DELAY="${SUNSHINE_SUPERVISE_RESTART_DELAY:-2}"
-SUNSHINE_SAFE_ENCODER="${SUNSHINE_SAFE_ENCODER:-software}" # software first to isolate VAAPI/KMS bugs
+SUNSHINE_SAFE_ENCODER="${SUNSHINE_SAFE_ENCODER:-software}"
 SUNSHINE_SAFE_CAPTURE="${SUNSHINE_SAFE_CAPTURE:-kms}"
 SUNSHINE_SAFE_MAX_BITRATE="${SUNSHINE_SAFE_MAX_BITRATE:-30000}"
 SUNSHINE_SAFE_FPS_TARGET="${SUNSHINE_SAFE_FPS_TARGET:-60}"
@@ -188,14 +144,15 @@ SUNSHINE_PERF_MAX_BITRATE="${SUNSHINE_PERF_MAX_BITRATE:-20000}"
 SUNSHINE_PERF_FPS_TARGET="${SUNSHINE_PERF_FPS_TARGET:-60}"
 SUNSHINE_PERF_QP="${SUNSHINE_PERF_QP:-15}"
 SUNSHINE_PERF_FEC="${SUNSHINE_PERF_FEC:-5}"
-SUNSHINE_PERF_HEVC_MODE="${SUNSHINE_PERF_HEVC_MODE:-1}"   # 0=auto by encoder capability; 1=force H264-only; 2=force HEVC Main
-SUNSHINE_PERF_AV1_MODE="${SUNSHINE_PERF_AV1_MODE:-1}"     # UHD 630 has no AV1 encode; keep disabled
+SUNSHINE_PERF_HEVC_MODE="${SUNSHINE_PERF_HEVC_MODE:-1}"
+SUNSHINE_PERF_AV1_MODE="${SUNSHINE_PERF_AV1_MODE:-1}"
 SUNSHINE_PERF_MIN_THREADS="${SUNSHINE_PERF_MIN_THREADS:-2}"
 SUNSHINE_PERF_VAAPI_STRICT_RC_BUFFER="${SUNSHINE_PERF_VAAPI_STRICT_RC_BUFFER:-disabled}"
-SUNSHINE_PERF_VK_RC_MODE="${SUNSHINE_PERF_VK_RC_MODE:-1}" # only applies if encoder=vulkan; 1=CQP
+SUNSHINE_PERF_VK_RC_MODE="${SUNSHINE_PERF_VK_RC_MODE:-1}"
 SUNSHINE_SAFE_PING_TIMEOUT="${SUNSHINE_SAFE_PING_TIMEOUT:-30000}"
 SUNSHINE_WINDOW="${SUNSHINE_WINDOW:-sunshine}"
 SUNSHINE_TCP_PORTS="${SUNSHINE_TCP_PORTS:-47984 47989 47990 48010}"
+SUNSHINE_UDP_PORTS="${SUNSHINE_UDP_PORTS:-47998 47999 48000 48010}"
 SUNSHINE_REQUIRED_TCP_PORTS="${SUNSHINE_REQUIRED_TCP_PORTS:-47990 48010}"
 WAIT_SUNSHINE_PORTS="${WAIT_SUNSHINE_PORTS:-20}"
 WAIT_KWIN="${WAIT_KWIN:-45}"
@@ -209,9 +166,7 @@ if [[ -f "${CONFIG_FILE}" ]]; then
     source "${CONFIG_FILE}"
 fi
 
-# Optional repo-friendly JSON overlay. The classic .conf remains the stable runtime
-# source of truth; JSON is an optional override layer for deployments that prefer
-# a single structured config file. Requires jq; ignored safely when absent.
+# Optional structured JSON overlay configuration support
 _apply_json_scalar() {
     local var="$1" jqpath="$2" val
     command -v jq >/dev/null 2>&1 || return 0
@@ -220,6 +175,13 @@ _apply_json_scalar() {
     [[ -n "${val}" && "${val}" != "null" ]] || return 0
     printf -v "${var}" '%s' "${val}"
 }
+
+if [[ "${PLASMACTL_USE_JSON_CONFIG}" == "true" ]]; then
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "[plasmactl] ERROR: PLASMACTL_USE_JSON_CONFIG=true is set, but 'jq' is not installed." >&2
+        exit 1
+    fi
+fi
 
 if [[ "${PLASMACTL_USE_JSON_CONFIG}" != "false" && -f "${PLASMACTL_JSON_CONFIG}" ]]; then
     if command -v jq >/dev/null 2>&1; then
@@ -312,10 +274,10 @@ WAYLAND_DISPLAY_DETECTED=""
 
 REQUIRED_BINS=(tmux loginctl systemctl dbus-run-session kwin_wayland plasmashell startplasma-wayland pgrep pkill awk sed tr readlink basename date ss tee)
 
-mkdir -p "${STATE_DIR}" "${DEBUG_DIR}" "${LOG_DIR}" "${CONFIG_DIR}" "${PLASMACTL_PROFILE_DIR}"
+mkdir -p "${STATE_DIR}" "${DEBUG_DIR}" "${LOG_DIR}" "${CONFIG_DIR}" "${PLASMACTL_PROFILE_DIR}" "${SUNSHINE_CONFIG_DIR}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOGGING
+# LOGGING & SYSLOG INTEGRATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
@@ -336,6 +298,7 @@ err() {
     local msg="[${_LOG_CTX:-plasmactl}] $(_ts) ERROR: $*"
     echo "${msg}" >&2
     echo "${msg}" >> "${LAST_LOG}"
+    logger -p user.err -t "plasmactl" "$*" 2>/dev/null || true
 }
 
 _pass() { printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
@@ -344,37 +307,22 @@ _warn() { printf '  \033[1;33m!\033[0m %s\n' "$*"; }
 _info() { printf '  \033[1;34m→\033[0m %s\n' "$*"; }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GENERAL HELPERS
+# GENERAL HELPERS & LOCKING
 # ─────────────────────────────────────────────────────────────────────────────
-
-_sudo() {
-    if sudo -n true 2>/dev/null; then
-        sudo -n "$@"
-    else
-        return 1
-    fi
-}
-
-_priv() {
-    if [[ "${EUID}" -eq 0 ]]; then
-        "$@"
-    else
-        _sudo "$@"
-    fi
-}
 
 _bool_true() {
     case "${1:-}" in true|yes|1|on|enabled) return 0 ;; *) return 1 ;; esac
 }
 
+# Scope process queries strictly to the active target user REAL_UID
 _pid_first() {
     local name="$1"
-    pgrep -xo "${name}" 2>/dev/null || true
+    pgrep -u "${REAL_UID}" -xo "${name}" 2>/dev/null || true
 }
 
 _pid_newest() {
     local name="$1"
-    pgrep -xn "${name}" 2>/dev/null || true
+    pgrep -u "${REAL_UID}" -xn "${name}" 2>/dev/null || true
 }
 
 _pid_env() {
@@ -384,8 +332,7 @@ _pid_env() {
 }
 
 _escape_sq() {
-    # Safe single-quote escape for shell injection into tmux.
-    printf "%s" "$1" | sed "s/'/'\\''/g"
+    printf "%s" "$1" | sed "s/'/'\\\\''/g"
 }
 
 check_required_bins() {
@@ -398,10 +345,6 @@ check_required_bins() {
         return 1
     fi
 }
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LOCK
-# ─────────────────────────────────────────────────────────────────────────────
 
 acquire_lock() {
     local timeout=10 waited=0 holder=""
@@ -419,17 +362,18 @@ acquire_lock() {
         fi
         sleep 1; (( waited++ ))
     done
-    trap release_lock EXIT
+    trap release_lock EXIT INT TERM
     vlog "Lock acquired (PID $$)"
 }
+
 release_lock() { rm -f "${LOCK_FILE}"; }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOGINCTL / TMUX
+# LOGINCTL / TMUX MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
 get_tty_session_id() {
-    loginctl list-sessions --no-legend 2>/dev/null | awk -v tty="${TTY_NAME}" '$7==tty {print $1; exit}'
+    "${LOGINCTL_BIN}" list-sessions --no-legend 2>/dev/null | awk -v tty="${TTY_NAME}" '$7==tty {print $1; exit}'
 }
 
 check_tty_session() {
@@ -439,24 +383,24 @@ check_tty_session() {
 check_tty_seat0() {
     local sid; sid="$(get_tty_session_id)"
     [[ -n "${sid}" ]] || return 1
-    loginctl show-session "${sid}" -p Seat --value 2>/dev/null | grep -qx 'seat0'
+    "${LOGINCTL_BIN}" show-session "${sid}" -p Seat --value 2>/dev/null | grep -qx 'seat0'
 }
 
 get_session_active_state() {
     local sid="$1"
     [[ -n "${sid}" ]] || return 1
-    loginctl show-session "${sid}" -p Active --value 2>/dev/null || true
+    "${LOGINCTL_BIN}" show-session "${sid}" -p Active --value 2>/dev/null || true
 }
 
 get_active_session_id() {
-    loginctl show-seat seat0 -p ActiveSession --value 2>/dev/null | awk '{print $1}'
+    "${LOGINCTL_BIN}" show-seat seat0 -p ActiveSession --value 2>/dev/null | awk '{print $1}'
 }
 
 get_active_tty_name() {
     local active_sid tty=""
     active_sid="$(get_active_session_id || true)"
     if [[ -n "${active_sid}" ]]; then
-        tty="$(loginctl show-session "${active_sid}" -p TTY --value 2>/dev/null || true)"
+        tty="$("${LOGINCTL_BIN}" show-session "${active_sid}" -p TTY --value 2>/dev/null || true)"
     fi
     if [[ -z "${tty}" && -r /sys/class/tty/tty0/active ]]; then
         tty="$(cat /sys/class/tty/tty0/active 2>/dev/null | awk '{print $NF}')"
@@ -476,11 +420,9 @@ _activate_tty_session() {
 
     log "Activating ${target_tty} session ${sid} on seat0 before Plasma/KMS capture..."
 
-    # Prefer non-interactive chvt first to avoid Polkit password prompts over SSH.
-    # Fallback to loginctl activate when chvt is not permitted.
-    if _sudo /usr/bin/chvt "${target_tty#tty}" >/dev/null 2>&1; then
-        vlog "sudo -n /usr/bin/chvt ${target_tty#tty}: OK"
-    elif loginctl activate "${sid}" >/dev/null 2>&1; then
+    if _sudo "${CHVT_BIN}" "${target_tty#tty}" >/dev/null 2>&1; then
+        vlog "sudo -n ${CHVT_BIN} ${target_tty#tty}: OK"
+    elif "${LOGINCTL_BIN}" activate "${sid}" >/dev/null 2>&1; then
         vlog "loginctl activate ${sid}: OK"
     else
         _warn "Could not switch active VT automatically. Configure passwordless sudo for chvt or run: sudo chvt ${target_tty#tty}"
@@ -513,34 +455,34 @@ ensure_tty_active_for_kms() {
     _activate_tty_session "${sid}" && return 0
     if [[ "${REQUIRE_ACTIVE_TTY_ON_START}" == "true" ]]; then
         err "${TTY_NAME} is not active. KMS capture will stream the current VT/login screen instead of Plasma."
-        echo "Fix once: echo '${REAL_USER} ALL=(root) NOPASSWD: /usr/bin/chvt' | sudo tee /etc/sudoers.d/plasmactl-chvt" >&2
-        echo "Then retry: ~/bin/plasmactl restart --verbose" >&2
+        echo "Fix once: echo '${REAL_USER} ALL=(root) NOPASSWD: ${CHVT_BIN}' | sudo tee /etc/sudoers.d/plasmactl-chvt" >&2
+        echo "Then retry: plasmactl restart --verbose" >&2
         return 1
     fi
     return 0
 }
 
 check_tmux_session() {
-    tmux has-session -t "${SESSION}" 2>/dev/null || return 1
-    tmux list-windows -t "${SESSION}" >/dev/null 2>&1
+    _run_as_user "${TMUX_BIN}" has-session -t "${SESSION}" 2>/dev/null || return 1
+    _run_as_user "${TMUX_BIN}" list-windows -t "${SESSION}" >/dev/null 2>&1
 }
 
 check_tmux_attached() {
     check_tmux_session || return 1
     local attached
-    attached="$(tmux display-message -p -t "${SESSION}" '#{session_attached}' 2>/dev/null || echo 0)"
+    attached="$(_run_as_user "${TMUX_BIN}" display-message -p -t "${SESSION}" '#{session_attached}' 2>/dev/null || echo 0)"
     [[ "${attached}" != "0" ]]
 }
 
 send_tmux_command() {
     local cmd="$1"
-    tmux send-keys -t "${SESSION}" C-c
+    _run_as_user "${TMUX_BIN}" send-keys -t "${SESSION}" C-c
     sleep 0.2
-    tmux send-keys -t "${SESSION}" "${cmd}" C-m
+    _run_as_user "${TMUX_BIN}" send-keys -t "${SESSION}" "${cmd}" C-m
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DRM / GPU DETECTION
+# DRM / GPU DETECTION (CONSOLIDATED CORE HELPER)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _card_name_from_dir() { basename "$1"; }
@@ -575,8 +517,6 @@ _card_render_node() {
     for r in /sys/class/drm/${card_name}/device/drm/renderD*; do
         [[ -e "${r}" ]] || continue
         node="/dev/dri/$(basename "${r}")"
-        # Prefer stable by-path symlink when available. Sunshine accepts /dev/dri/renderD*;
-        # by-path avoids stale renderD numbering across reboots on multi-GPU hosts.
         for byp in /dev/dri/by-path/*-render; do
             [[ -e "${byp}" ]] || continue
             if [[ "$(readlink -f "${byp}" 2>/dev/null || true)" == "$(readlink -f "${node}" 2>/dev/null || true)" ]]; then
@@ -595,72 +535,6 @@ _card_driver_from_dev() {
     card_dir="/sys/class/drm/$(basename "${dev}")"
     [[ -d "${card_dir}" ]] || return 1
     _card_driver "${card_dir}"
-}
-
-_selected_sunshine_adapter() {
-    local selected_card adapter
-    if [[ -n "${SUNSHINE_ADAPTER_NAME}" ]]; then
-        echo "${SUNSHINE_ADAPTER_NAME}"; return 0
-    fi
-    case "${SUNSHINE_ADAPTER_MODE}" in
-        disabled|none|off|auto|"")
-            # In v0.4.0 systemd-run mode, GPU selection is enforced by DeviceAllow.
-            # Leaving adapter_name unset lets Sunshine auto-select the only permitted GPU.
-            return 1
-            ;;
-        preserve)
-            adapter="$(_sunshine_conf_get adapter_name 2>/dev/null || true)"
-            [[ -n "${adapter}" ]] && { echo "${adapter}"; return 0; }
-            return 1
-            ;;
-        selected)
-            selected_card="$(basename "${TARGET_DRM_DEVICE:-}" 2>/dev/null || true)"
-            if [[ -n "${selected_card}" ]]; then
-                adapter="$(_card_render_node "${selected_card}" 2>/dev/null || true)"
-                [[ -n "${adapter}" ]] && { echo "${adapter}"; return 0; }
-            fi
-            return 1
-            ;;
-        path)
-            [[ -n "${SUNSHINE_ADAPTER_NAME}" ]] && { echo "${SUNSHINE_ADAPTER_NAME}"; return 0; }
-            return 1
-            ;;
-        *)
-            _warn "Unknown SUNSHINE_ADAPTER_MODE=${SUNSHINE_ADAPTER_MODE}; leaving adapter_name unset."
-            return 1
-            ;;
-    esac
-}
-
-
-_selected_sunshine_output() {
-    local output=""
-    case "${SUNSHINE_OUTPUT_MODE}" in
-        disabled|none|off)
-            return 1
-            ;;
-        preserve)
-            output="$(_sunshine_conf_get output_name 2>/dev/null || true)"
-            [[ -n "${output}" ]] && { echo "${output}"; return 0; }
-            return 1
-            ;;
-        selected|auto|"")
-            # Sunshine expects a display id for Linux. Because KWin is started on the selected DRM
-            # device, the compositor-visible stream output should be display id 0 in Sunshine's list.
-            output="${SUNSHINE_OUTPUT_NAME:-0}"
-            [[ -n "${output}" ]] && { echo "${output}"; return 0; }
-            echo "0"; return 0
-            ;;
-        path|name|id)
-            output="${SUNSHINE_OUTPUT_NAME:-}"
-            [[ -n "${output}" ]] && { echo "${output}"; return 0; }
-            return 1
-            ;;
-        *)
-            _warn "Unknown SUNSHINE_OUTPUT_MODE=${SUNSHINE_OUTPUT_MODE}; using output_name=${SUNSHINE_OUTPUT_NAME:-0}."
-            echo "${SUNSHINE_OUTPUT_NAME:-0}"; return 0
-            ;;
-    esac
 }
 
 _card_has_connected_display() {
@@ -693,14 +567,12 @@ _first_connected_connector() {
 }
 
 _connector_short_name() {
-    # card1-HDMI-A-1 -> HDMI-A-1
     local name="$1"
     echo "${name}" | sed -E 's/^card[0-9]+-//'
 }
 
 _connector_sysfs_path() {
     local input="$1" connector
-    # Accept card1-HDMI-A-1 or HDMI-A-1. Prefer exact card-qualified path.
     if [[ -d "/sys/class/drm/${input}" ]]; then
         echo "/sys/class/drm/${input}"; return 0
     fi
@@ -715,32 +587,6 @@ _selected_card_name() {
     basename "${TARGET_DRM_DEVICE}"
 }
 
-_require_kms_output_ready() {
-    _bool_true "${REQUIRE_CONNECTED_OUTPUT_ON_START}" || return 0
-    local card_name connectors
-    card_name="$(_selected_card_name || true)"
-    [[ -n "${card_name}" ]] || return 0
-    connectors="$(_card_connected_connectors "${card_name}" | paste -sd ' ' -)"
-    if [[ -n "${connectors}" ]]; then
-        vlog "Connected KMS output(s) on ${card_name}: ${connectors}"
-        return 0
-    fi
-    err "Selected DRM target ${TARGET_DRM_DEVICE} has no connected KMS output/CRTC."
-    cat >&2 <<EOF_NO_OUTPUT
-For the current Plasma Wayland + Sunshine KMS architecture, a connected output is required.
-Use one of these:
-  1) HDMI/DP dummy plug on the target GPU/iGPU; or
-  2) kernel-forced EDID, then reboot and confirm connector status becomes connected; or
-  3) set REQUIRE_CONNECTED_OUTPUT_ON_START=false only for diagnostics, knowing Moonlight may fail with 503.
-
-Run:
-  plasmactl headless-check
-  plasmactl headless-edid status
-  plasmactl headless-edid params
-EOF_NO_OUTPUT
-    return 1
-}
-
 _is_vkms_card() {
     local card_dir="$1" dev_path driver
     dev_path="$(_card_device_path "${card_dir}")"
@@ -752,6 +598,66 @@ _is_vkms_card() {
 }
 
 _card_is_real() { ! _is_vkms_card "$1"; }
+
+# Consolidated DRM Card Finder
+_find_drm_card() {
+    local driver="" require_connected=false require_real=true require_vkms=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --driver) driver="$2"; shift ;;
+            --connected) require_connected=true ;;
+            --real) require_real=true ;;
+            --vkms) require_vkms=true; require_real=false ;;
+        esac
+        shift
+    done
+    local card_dir cname dev drv
+    for card_dir in /sys/class/drm/card[0-9]*; do
+        cname="$(_card_name_from_dir "${card_dir}")"
+        [[ "${cname}" =~ ^card[0-9]+$ ]] || continue
+        if ${require_vkms}; then
+            _is_vkms_card "${card_dir}" || continue
+        elif ${require_real}; then
+            _card_is_real "${card_dir}" || continue
+        fi
+        if [[ -n "${driver}" ]]; then
+            drv="$(_card_driver "${card_dir}")"
+            [[ "${drv}" == "${driver}" ]] || continue
+        fi
+        if ${require_connected}; then
+            _card_has_connected_display "${cname}" || continue
+        fi
+        dev="$(_card_dev_from_name "${cname}")"
+        [[ -e "${dev}" ]] || continue
+        echo "${dev}"
+        return 0
+    done
+    return 1
+}
+
+_find_connected_card_by_driver() { _find_drm_card --driver "$1" --connected --real; }
+_find_card_by_driver()           { _find_drm_card --driver "$1" --real; }
+_find_connected_real_card()     { _find_drm_card --connected --real; }
+_find_any_real_card()          { _find_drm_card --real; }
+_find_vkms_card()              { _find_drm_card --vkms; }
+
+_find_connected_card_by_driver_list() {
+    local drv found
+    for drv in $1; do
+        found="$(_find_connected_card_by_driver "${drv}" || true)"
+        [[ -n "${found}" ]] && { echo "${found}"; return 0; }
+    done
+    return 1
+}
+
+_find_card_by_driver_list() {
+    local drv found
+    for drv in $1; do
+        found="$(_find_card_by_driver "${drv}" || true)"
+        [[ -n "${found}" ]] && { echo "${found}"; return 0; }
+    done
+    return 1
+}
 
 _print_drm_map() {
     local card_dir cname dev driver vendor conn vkms rec
@@ -769,16 +675,6 @@ _print_drm_map() {
         [[ "${dev}" == "${TARGET_DRM_DEVICE:-}" ]] && rec=" ← selected"
         printf '  %-10s → %-12s vendor=%-8s%s%s%s\n' "${cname}" "${driver}" "${vendor:-?}" "${conn}" "${vkms}" "${rec}"
     done
-}
-
-
-_driver_in_list() {
-    local needle="$1" item
-    shift || true
-    for item in "$@"; do
-        [[ "${item}" == "${needle}" ]] && return 0
-    done
-    return 1
 }
 
 _effective_gpu_role() {
@@ -845,27 +741,8 @@ _assert_target_driver_policy() {
     return 0
 }
 
-_find_connected_card_by_driver_list() {
-    local drv found
-    for drv in $1; do
-        found="$(_find_connected_card_by_driver "${drv}" || true)"
-        [[ -n "${found}" ]] && { echo "${found}"; return 0; }
-    done
-    return 1
-}
-
-_find_card_by_driver_list() {
-    local drv found
-    for drv in $1; do
-        found="$(_find_card_by_driver "${drv}" || true)"
-        [[ -n "${found}" ]] && { echo "${found}"; return 0; }
-    done
-    return 1
-}
-
 _resolve_configured_drm() {
     local configured="${PLASMA_DRM_DEVICE:-auto}"
-    # Runtime GPU role overrides intentionally bypass a static PLASMA_DRM_DEVICE path.
     if [[ -n "${PLASMA_GPU_OVERRIDE:-}" && "${PLASMA_GPU_OVERRIDE}" != "auto" ]]; then
         return 2
     fi
@@ -879,87 +756,12 @@ _resolve_configured_drm() {
         fi
         if _bool_true "${PLASMA_DRM_DEVICE_AUTO_FALLBACK}"; then
             _warn "Configured PLASMA_DRM_DEVICE=${configured} does not exist; falling back to auto DRM detection."
-            _warn "This often happens after booting with no monitor/dummy connected or when card numbering changes."
             return 2
         fi
         err "Configured PLASMA_DRM_DEVICE=${configured} does not exist"
         return 1
     fi
     return 2
-}
-
-_find_card_by_driver() {
-    local wanted="$1" card_dir cname dev
-    for card_dir in /sys/class/drm/card[0-9]*; do
-        cname="$(_card_name_from_dir "${card_dir}")"
-        [[ "${cname}" =~ ^card[0-9]+$ ]] || continue
-        _card_is_real "${card_dir}" || continue
-        [[ "$(_card_driver "${card_dir}")" == "${wanted}" ]] || continue
-        dev="$(_card_dev_from_name "${cname}")"
-        [[ -e "${dev}" ]] || continue
-        echo "${dev}"
-        return 0
-    done
-    return 1
-}
-
-_find_connected_card_by_driver() {
-    local wanted="$1" card_dir cname dev
-    for card_dir in /sys/class/drm/card[0-9]*; do
-        cname="$(_card_name_from_dir "${card_dir}")"
-        [[ "${cname}" =~ ^card[0-9]+$ ]] || continue
-        _card_is_real "${card_dir}" || continue
-        [[ "$(_card_driver "${card_dir}")" == "${wanted}" ]] || continue
-        _card_has_connected_display "${cname}" || continue
-        dev="$(_card_dev_from_name "${cname}")"
-        [[ -e "${dev}" ]] || continue
-        echo "${dev}"
-        return 0
-    done
-    return 1
-}
-
-_find_connected_real_card() {
-    local card_dir cname dev
-    for card_dir in /sys/class/drm/card[0-9]*; do
-        cname="$(_card_name_from_dir "${card_dir}")"
-        [[ "${cname}" =~ ^card[0-9]+$ ]] || continue
-        _card_is_real "${card_dir}" || continue
-        _card_has_connected_display "${cname}" || continue
-        dev="$(_card_dev_from_name "${cname}")"
-        [[ -e "${dev}" ]] || continue
-        echo "${dev}"
-        return 0
-    done
-    return 1
-}
-
-_find_any_real_card() {
-    local card_dir cname dev
-    for card_dir in /sys/class/drm/card[0-9]*; do
-        cname="$(_card_name_from_dir "${card_dir}")"
-        [[ "${cname}" =~ ^card[0-9]+$ ]] || continue
-        _card_is_real "${card_dir}" || continue
-        dev="$(_card_dev_from_name "${cname}")"
-        [[ -e "${dev}" ]] || continue
-        echo "${dev}"
-        return 0
-    done
-    return 1
-}
-
-_find_vkms_card() {
-    local card_dir cname dev
-    for card_dir in /sys/class/drm/card[0-9]*; do
-        cname="$(_card_name_from_dir "${card_dir}")"
-        [[ "${cname}" =~ ^card[0-9]+$ ]] || continue
-        _is_vkms_card "${card_dir}" || continue
-        dev="$(_card_dev_from_name "${cname}")"
-        [[ -e "${dev}" ]] || continue
-        echo "${dev}"
-        return 0
-    done
-    return 1
 }
 
 resolve_plasma_drm_device() {
@@ -978,26 +780,21 @@ resolve_plasma_drm_device() {
         found="$(_find_connected_card_by_driver "${PLASMA_DRM_REQUIRE_DRIVER}" || true)"
         [[ -z "${found}" ]] && found="$(_find_card_by_driver "${PLASMA_DRM_REQUIRE_DRIVER}" || true)"
         if [[ -z "${found}" ]]; then
-            err "PLASMA_DRM_REQUIRE_DRIVER=${PLASMA_DRM_REQUIRE_DRIVER} was requested, but no such DRM card exists."
-            echo "Run: plasmactl headless-check" >&2
+            err "PLASMA_DRM_REQUIRE_DRIVER=${PLASMA_DRM_REQUIRE_DRIVER} requested, but no matching DRM card exists."
             return 1
         fi
     fi
 
-    # Enforced GPU role path: igpu/dgpu must not silently fall back unless explicitly allowed.
     if [[ -z "${found}" && "${role}" != "auto" ]]; then
         found="$(_find_connected_card_by_driver_list "${role_drivers}" || true)"
         [[ -z "${found}" ]] && found="$(_find_card_by_driver_list "${role_drivers}" || true)"
         if [[ -z "${found}" ]] && ! _bool_true "${PLASMA_GPU_ALLOW_FALLBACK}"; then
-            err "GPU role '${role}' requested, but no matching DRM card exists."
-            err "Drivers for '${role}': ${role_drivers}"
-            err "Current DRM map:"
+            err "GPU role '${role}' requested, but no matching DRM card exists (drivers: ${role_drivers})."
             _print_drm_map >&2 || true
             return 1
         fi
     fi
 
-    # General auto/fallback path: prefer connected outputs in configured order.
     if [[ -z "${found}" ]]; then
         for drv in ${PLASMA_DRM_DRIVER_ORDER}; do
             found="$(_find_connected_card_by_driver "${drv}" || true)"
@@ -1005,10 +802,8 @@ resolve_plasma_drm_device() {
         done
     fi
 
-    # Then prefer any real card with a connected connector; useful for explicitly allowing fallback/dummy HDMI/DP.
     [[ -z "${found}" ]] && found="$(_find_connected_real_card || true)"
 
-    # Then fall back by driver order even without a connector. REQUIRE_CONNECTED_OUTPUT_ON_START will catch this later.
     if [[ -z "${found}" ]]; then
         for drv in ${PLASMA_DRM_DRIVER_ORDER}; do
             found="$(_find_card_by_driver "${drv}" || true)"
@@ -1023,7 +818,6 @@ resolve_plasma_drm_device() {
 
     if [[ -z "${found}" ]]; then
         err "No suitable real DRM card found. Run: plasmactl detect-gpu --verbose"
-        err "If you intentionally want VKMS, set ALLOW_VKMS=true in ${CONFIG_FILE}"
         return 1
     fi
 
@@ -1043,19 +837,16 @@ cmd_detect_gpu() {
     echo ""
     echo "Selected Plasma DRM target: ${TARGET_DRM_DEVICE:-not resolved}"
     echo "Config file: ${CONFIG_FILE}"
-    echo "Override example:"
-    echo "  mkdir -p ~/.config"
-    echo "  echo 'PLASMA_DRM_DEVICE=/dev/dri/card1' > ~/.config/plasmactl.conf"
     echo ""
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PLASMA HEALTH
+# PLASMA HEALTH & PROCESS MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
-_kwin_pids() { pgrep -x kwin_wayland 2>/dev/null || true; }
-_plasmashell_pids() { pgrep -x plasmashell 2>/dev/null || true; }
-_xwayland_pids() { pgrep -x Xwayland 2>/dev/null || true; }
+_kwin_pids() { pgrep -u "${REAL_UID}" -x kwin_wayland 2>/dev/null || true; }
+_plasmashell_pids() { pgrep -u "${REAL_UID}" -x plasmashell 2>/dev/null || true; }
+_xwayland_pids() { pgrep -u "${REAL_UID}" -x Xwayland 2>/dev/null || true; }
 
 get_kwin_pid_for_target() {
     local pid envdev
@@ -1068,7 +859,6 @@ get_kwin_pid_for_target() {
         fi
     done < <(_kwin_pids)
 
-    # Fallback: if exactly one kwin exists, accept it but log that env did not match/was unavailable.
     local count first
     count="$(_kwin_pids | awk 'NF{c++} END{print c+0}')"
     if [[ "${count}" == "1" ]]; then
@@ -1081,7 +871,7 @@ get_kwin_pid_for_target() {
 check_kwin() { [[ -n "$(get_kwin_pid_for_target 2>/dev/null || true)" ]]; }
 check_plasmashell() { [[ -n "$(_pid_first plasmashell)" ]]; }
 check_xwayland() { [[ -n "$(_pid_first Xwayland)" ]]; }
-check_startplasma_running() { pgrep -fa 'startplasma-wayland|dbus-run-session.*startplasma' >/dev/null 2>&1; }
+check_startplasma_running() { pgrep -u "${REAL_UID}" -fa 'startplasma-wayland|dbus-run-session.*startplasma' >/dev/null 2>&1; }
 
 _detect_wayland_display_from_pid() {
     local pid="$1" wd xrd
@@ -1114,70 +904,76 @@ check_plasma_healthy() {
     check_kwin && check_wayland_socket && check_plasmashell
 }
 
+# Polling loops optimized to 0.2s intervals (5 ticks per second)
 wait_for() {
-    local label="$1" timeout="$2" check_fn="$3" waited=0
+    local label="$1" timeout="$2" check_fn="$3" waited_ticks=0
+    local max_ticks=$(( timeout * 5 ))
     log "Waiting for ${label} (max ${timeout}s)..."
     while ! ${check_fn}; do
-        if [[ ${waited} -ge ${timeout} ]]; then
+        if [[ ${waited_ticks} -ge ${max_ticks} ]]; then
             err "Timeout waiting for ${label} after ${timeout}s"
             return 1
         fi
-        sleep 1; (( waited++ ))
-        vlog "  ${label}: ${waited}s"
+        sleep 0.2
+        (( waited_ticks++ ))
     done
-    log "${label} ready after ${waited}s"
+    local sec=$(( waited_ticks / 5 ))
+    local tenths=$(( (waited_ticks % 5) * 2 ))
+    log "${label} ready after ${sec}.${tenths}s"
 }
 
 wait_gone() {
-    local label="$1" timeout="$2" check_fn="$3" waited=0
+    local label="$1" timeout="$2" check_fn="$3" waited_ticks=0
+    local max_ticks=$(( timeout * 5 ))
     log "Waiting for ${label} to exit (max ${timeout}s)..."
     while ${check_fn}; do
-        if [[ ${waited} -ge ${timeout} ]]; then
+        if [[ ${waited_ticks} -ge ${max_ticks} ]]; then
             err "Timeout: ${label} still running after ${timeout}s"
             return 1
         fi
-        sleep 1; (( waited++ ))
-        vlog "  ${label} alive: ${waited}s"
+        sleep 0.2
+        (( waited_ticks++ ))
     done
-    log "${label} exited after ${waited}s"
+    local sec=$(( waited_ticks / 5 ))
+    local tenths=$(( (waited_ticks % 5) * 2 ))
+    log "${label} exited after ${sec}.${tenths}s"
 }
 
 _stop_plasma_processes() {
     if check_plasmashell; then
-        log "Stopping plasmashell..."
-        pkill -TERM plasmashell 2>/dev/null || true
-        wait_gone "plasmashell" "${WAIT_STOP}" check_plasmashell || pkill -KILL plasmashell 2>/dev/null || true
+        log "Stopping plasmashell for user ${REAL_USER}..."
+        pkill -u "${REAL_UID}" -TERM plasmashell 2>/dev/null || true
+        wait_gone "plasmashell" "${WAIT_STOP}" check_plasmashell || pkill -u "${REAL_UID}" -KILL plasmashell 2>/dev/null || true
     fi
     if check_xwayland; then
-        log "Stopping Xwayland..."
-        pkill -TERM Xwayland 2>/dev/null || true
-        wait_gone "Xwayland" 5 check_xwayland || pkill -KILL Xwayland 2>/dev/null || true
+        log "Stopping Xwayland for user ${REAL_USER}..."
+        pkill -u "${REAL_UID}" -TERM Xwayland 2>/dev/null || true
+        wait_gone "Xwayland" 5 check_xwayland || pkill -u "${REAL_UID}" -KILL Xwayland 2>/dev/null || true
     fi
     if check_kwin || [[ -n "$(_pid_first kwin_wayland)" ]]; then
-        log "Stopping kwin_wayland..."
-        pkill -TERM kwin_wayland 2>/dev/null || true
-        wait_gone "kwin_wayland" "${WAIT_STOP}" check_any_kwin || pkill -KILL kwin_wayland 2>/dev/null || true
+        log "Stopping kwin_wayland for user ${REAL_USER}..."
+        pkill -u "${REAL_UID}" -TERM kwin_wayland 2>/dev/null || true
+        wait_gone "kwin_wayland" "${WAIT_STOP}" check_any_kwin || pkill -u "${REAL_UID}" -KILL kwin_wayland 2>/dev/null || true
     fi
-    pkill -TERM -f 'dbus-run-session.*startplasma-wayland' 2>/dev/null || true
-    pkill -TERM -f 'startplasma-wayland' 2>/dev/null || true
+    pkill -u "${REAL_UID}" -TERM -f 'dbus-run-session.*startplasma-wayland' 2>/dev/null || true
+    pkill -u "${REAL_UID}" -TERM -f 'startplasma-wayland' 2>/dev/null || true
 }
+
 check_any_kwin() { [[ -n "$(_pid_first kwin_wayland)" ]]; }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SUNSHINE
+# SUNSHINE MANAGED COMPONENT
 # ─────────────────────────────────────────────────────────────────────────────
 
 check_sunshine_exists() {
-    systemctl --user cat "${SUNSHINE_UNIT}" >/dev/null 2>&1 || systemctl --user cat sunshine.service >/dev/null 2>&1
+    _run_as_user "${SYSTEMCTL_BIN}" --user cat "${SUNSHINE_UNIT}" >/dev/null 2>&1 || _run_as_user "${SYSTEMCTL_BIN}" --user cat sunshine.service >/dev/null 2>&1
 }
-check_sunshine_service_active() { systemctl --user is-active --quiet "${SUNSHINE_UNIT}" 2>/dev/null; }
-check_sunshine_enabled() { systemctl --user is-enabled --quiet "${SUNSHINE_UNIT}" 2>/dev/null; }
-check_sunshine_process() { pgrep -x sunshine >/dev/null 2>&1; }
+check_sunshine_service_active() { _run_as_user "${SYSTEMCTL_BIN}" --user is-active --quiet "${SUNSHINE_UNIT}" 2>/dev/null; }
+check_sunshine_enabled()        { _run_as_user "${SYSTEMCTL_BIN}" --user is-enabled --quiet "${SUNSHINE_UNIT}" 2>/dev/null; }
+check_sunshine_process()        { pgrep -u "${REAL_UID}" -x sunshine >/dev/null 2>&1; }
+check_sunshine()                { check_sunshine_process; }
 
-# Backward-compatible name used by old call sites; in v0.2.6 this means real process.
-check_sunshine() { check_sunshine_process; }
-
-_sunshine_pids() { pgrep -x sunshine 2>/dev/null || true; }
+_sunshine_pids()       { pgrep -u "${REAL_UID}" -x sunshine 2>/dev/null || true; }
 _sunshine_newest_pid() { _pid_newest sunshine; }
 
 _sunshine_listeners() {
@@ -1191,6 +987,7 @@ _tcp_port_listening() {
     local port="$1"
     ss -ltn 2>/dev/null | awk -v p=":${port}" '$4 ~ p"$" {found=1} END{exit !found}'
 }
+
 _udp_port_listening() {
     local port="$1"
     ss -lun 2>/dev/null | awk -v p=":${port}" '$5 ~ p"$" {found=1} END{exit !found}'
@@ -1211,20 +1008,15 @@ _print_sunshine_ports_status() {
     local port ok_any=false
     for port in ${SUNSHINE_TCP_PORTS}; do
         if _tcp_port_listening "${port}"; then
-            printf '    tcp/%s: LISTEN
-' "${port}"
+            printf '    tcp/%s: LISTEN\n' "${port}"
             ok_any=true
         else
-            printf '    tcp/%s: closed
-' "${port}"
+            printf '    tcp/%s: closed\n' "${port}"
         fi
     done
-    # UDP may not be visible until session negotiation depending on Sunshine build/config,
-    # so report it, but do not make idle readiness depend on it.
-    for port in 47998 47999 48000 48010; do
+    for port in ${SUNSHINE_UDP_PORTS}; do
         if _udp_port_listening "${port}"; then
-            printf '    udp/%s: LISTEN
-' "${port}"
+            printf '    udp/%s: LISTEN\n' "${port}"
         fi
     done
     ${ok_any} || true
@@ -1235,26 +1027,24 @@ _show_sunshine_failure() {
     echo "[sunshine-listeners]"
     _sunshine_listeners | sed 's/^/[sunshine-listeners] /' || true
     echo "[sunshine-processes]"
-    pgrep -a sunshine 2>/dev/null | sed 's/^/[sunshine-process] /' || echo "[sunshine-process] none"
+    pgrep -u "${REAL_UID}" -a sunshine 2>/dev/null | sed 's/^/[sunshine-process] /' || echo "[sunshine-process] none"
     echo "[sunshine-service]"
-    systemctl --user status "${SUNSHINE_UNIT}" --no-pager -l 2>&1 | sed 's/^/[sunshine-status] /' || true
+    _run_as_user "${SYSTEMCTL_BIN}" --user status "${SUNSHINE_UNIT}" --no-pager -l 2>&1 | sed 's/^/[sunshine-status] /' || true
     echo "[sunshine-journal]"
-    journalctl --user -u "${SUNSHINE_UNIT}" -n 100 --no-pager 2>&1 | sed 's/^/[sunshine-journal] /' || true
+    _run_as_user journalctl --user -u "${SUNSHINE_UNIT}" -n 100 --no-pager 2>&1 | sed 's/^/[sunshine-journal] /' || true
     echo "[sunshine-tmux-log]"
     [[ -f "${SUNSHINE_TMUX_LOG}" ]] && tail -n 120 "${SUNSHINE_TMUX_LOG}" | sed 's/^/[sunshine-tmux] /' || echo "[sunshine-tmux] no tmux log"
 }
 
 _stop_sunshine_systemd() {
-    # Clear start-limit-hit and stop any unit instance. This service has been observed
-    # failing with signal=TRAP/start-limit-hit, so always reset it before retries.
-    systemctl --user stop "${SUNSHINE_UNIT}" sunshine.service >/dev/null 2>&1 || true
-    systemctl --user reset-failed "${SUNSHINE_UNIT}" sunshine.service >/dev/null 2>&1 || true
+    _run_as_user "${SYSTEMCTL_BIN}" --user stop "${SUNSHINE_UNIT}" sunshine.service >/dev/null 2>&1 || true
+    _run_as_user "${SYSTEMCTL_BIN}" --user reset-failed "${SUNSHINE_UNIT}" sunshine.service >/dev/null 2>&1 || true
 }
 
 _stop_sunshine_tmux_window() {
-    if tmux list-windows -t "${SESSION}" -F '#{window_name}' 2>/dev/null | grep -qx "${SUNSHINE_WINDOW}"; then
+    if _run_as_user "${TMUX_BIN}" list-windows -t "${SESSION}" -F '#{window_name}' 2>/dev/null | grep -qx "${SUNSHINE_WINDOW}"; then
         log "Stopping Sunshine tmux window '${SUNSHINE_WINDOW}'..."
-        tmux kill-window -t "${SESSION}:${SUNSHINE_WINDOW}" >/dev/null 2>&1 || true
+        _run_as_user "${TMUX_BIN}" kill-window -t "${SESSION}:${SUNSHINE_WINDOW}" >/dev/null 2>&1 || true
     fi
 }
 
@@ -1262,7 +1052,7 @@ _stop_sunshine_if_active() {
     local had=false
     if check_sunshine_service_active; then had=true; fi
     if check_sunshine_process; then had=true; fi
-    if tmux list-windows -t "${SESSION}" -F '#{window_name}' 2>/dev/null | grep -qx "${SUNSHINE_WINDOW}"; then had=true; fi
+    if _run_as_user "${TMUX_BIN}" list-windows -t "${SESSION}" -F '#{window_name}' 2>/dev/null | grep -qx "${SUNSHINE_WINDOW}"; then had=true; fi
 
     ${had} && log "Stopping Sunshine before Plasma transition..." || true
     _stop_sunshine_systemd_run
@@ -1270,8 +1060,8 @@ _stop_sunshine_if_active() {
     _stop_sunshine_tmux_window
 
     if check_sunshine_process; then
-        pkill -TERM -x sunshine 2>/dev/null || true
-        wait_gone "sunshine process" "${WAIT_STOP}" check_sunshine_process || pkill -KILL -x sunshine 2>/dev/null || true
+        pkill -u "${REAL_UID}" -TERM -x sunshine 2>/dev/null || true
+        wait_gone "sunshine process" "${WAIT_STOP}" check_sunshine_process || pkill -u "${REAL_UID}" -KILL -x sunshine 2>/dev/null || true
     fi
     rm -f "${SUNSHINE_PID_FILE}"
 }
@@ -1282,7 +1072,13 @@ _set_systemd_user_env_for_sunshine() {
     [[ -z "${wd}" && -f "${WAYLAND_DISPLAY_FILE}" ]] && wd="$(cat "${WAYLAND_DISPLAY_FILE}" 2>/dev/null || true)"
     if [[ -n "${wd}" ]]; then
         log "Importing Wayland environment into systemd --user (WAYLAND_DISPLAY=${wd})"
-        systemctl --user set-environment             "XDG_RUNTIME_DIR=${RUNTIME_DIR}"             "XDG_SESSION_TYPE=wayland"             "XDG_CURRENT_DESKTOP=KDE"             "KDE_FULL_SESSION=true"             "KWIN_DRM_DEVICES=${TARGET_DRM_DEVICE}"             "WAYLAND_DISPLAY=${wd}" 2>/dev/null || true
+        _run_as_user "${SYSTEMCTL_BIN}" --user set-environment \
+            "XDG_RUNTIME_DIR=${RUNTIME_DIR}" \
+            "XDG_SESSION_TYPE=wayland" \
+            "XDG_CURRENT_DESKTOP=KDE" \
+            "KDE_FULL_SESSION=true" \
+            "KWIN_DRM_DEVICES=${TARGET_DRM_DEVICE}" \
+            "WAYLAND_DISPLAY=${wd}" 2>/dev/null || true
     else
         _warn "WAYLAND_DISPLAY not detected; Sunshine will start without Wayland env import"
     fi
@@ -1291,15 +1087,12 @@ _set_systemd_user_env_for_sunshine() {
 _warn_if_sunshine_selected_vkms() {
     local since="${1:-}" fresh
     [[ -n "${since}" ]] || since="5 minutes ago"
-    fresh="$(journalctl --user -u "${SUNSHINE_UNIT}" --since "${since}" --no-pager 2>/dev/null || true)"
-    if printf '%s
-' "${fresh}" | grep -Eq '/dev/dri/card[0-9]+ -> (vkms|faux)|No render device name for: /dev/dri/card[0-9]+'; then
+    fresh="$(_run_as_user journalctl --user -u "${SUNSHINE_UNIT}" --since "${since}" --no-pager 2>/dev/null || true)"
+    if printf '%s\n' "${fresh}" | grep -Eq '/dev/dri/card[0-9]+ -> (vkms|faux)|No render device name for: /dev/dri/card[0-9]+'; then
         _warn "Sunshine appears to be selecting VKMS/faux for KMS capture. This can cause stream/RTSP failures."
-        printf '%s
-' "${fresh}" | grep -E '/dev/dri/card[0-9]+ ->|No render device name|wlgrab|wayland|KMS|CLIENT|RTSP|Error' | tail -n 25 | sed 's/^/[sunshine-fresh] /' || true
+        printf '%s\n' "${fresh}" | grep -E '/dev/dri/card[0-9]+ ->|No render device name|wlgrab|wayland|KMS|CLIENT|RTSP|Error' | tail -n 25 | sed 's/^/[sunshine-fresh] /' || true
     fi
 }
-
 
 _sunshine_conf_get() {
     local key="$1" file="${2:-${SUNSHINE_DEFAULT_CONFIG}}"
@@ -1319,21 +1112,88 @@ _sunshine_conf_get() {
     ' "${file}"
 }
 
-_write_sunshine_safe_assets() {
-    mkdir -p "${SUNSHINE_CONFIG_DIR}"
-    local name adapter output csrf
+_selected_sunshine_adapter() {
+    local selected_card adapter
+    if [[ -n "${SUNSHINE_ADAPTER_NAME}" ]]; then
+        echo "${SUNSHINE_ADAPTER_NAME}"; return 0
+    fi
+    case "${SUNSHINE_ADAPTER_MODE}" in
+        disabled|none|off|auto|"")
+            return 1
+            ;;
+        preserve)
+            adapter="$(_sunshine_conf_get adapter_name 2>/dev/null || true)"
+            [[ -n "${adapter}" ]] && { echo "${adapter}"; return 0; }
+            return 1
+            ;;
+        selected)
+            selected_card="$(basename "${TARGET_DRM_DEVICE:-}" 2>/dev/null || true)"
+            if [[ -n "${selected_card}" ]]; then
+                adapter="$(_card_render_node "${selected_card}" 2>/dev/null || true)"
+                [[ -n "${adapter}" ]] && { echo "${adapter}"; return 0; }
+            fi
+            return 1
+            ;;
+        path)
+            [[ -n "${SUNSHINE_ADAPTER_NAME}" ]] && { echo "${SUNSHINE_ADAPTER_NAME}"; return 0; }
+            return 1
+            ;;
+        *)
+            _warn "Unknown SUNSHINE_ADAPTER_MODE=${SUNSHINE_ADAPTER_MODE}; leaving adapter_name unset."
+            return 1
+            ;;
+    esac
+}
+
+_selected_sunshine_output() {
+    local output=""
+    case "${SUNSHINE_OUTPUT_MODE}" in
+        disabled|none|off)
+            return 1
+            ;;
+        preserve)
+            output="$(_sunshine_conf_get output_name 2>/dev/null || true)"
+            [[ -n "${output}" ]] && { echo "${output}"; return 0; }
+            return 1
+            ;;
+        selected|auto|"")
+            output="${SUNSHINE_OUTPUT_NAME:-0}"
+            [[ -n "${output}" ]] && { echo "${output}"; return 0; }
+            echo "0"; return 0
+            ;;
+        path|name|id)
+            output="${SUNSHINE_OUTPUT_NAME:-}"
+            [[ -n "${output}" ]] && { echo "${output}"; return 0; }
+            return 1
+            ;;
+        *)
+            echo "${SUNSHINE_OUTPUT_NAME:-0}"; return 0
+            ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REFACTORED DRY SUNSHINE PROFILE GENERATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+_write_sunshine_profile_conf() {
+    local target_file="$1" profile_name="$2" min_log="$3" encoder="$4" capture="$5" max_bitrate="$6" fps="$7" qp="$8" fec="$9" apps_file="${10}"
+    shift 10
+
+    local name adapter output csrf default_host
+    default_host="plasmactl-$(hostname 2>/dev/null || echo "host")"
     name="$(_sunshine_conf_get sunshine_name 2>/dev/null || true)"
     adapter="$(_selected_sunshine_adapter 2>/dev/null || true)"
     output="$(_selected_sunshine_output 2>/dev/null || true)"
     csrf="$(_sunshine_conf_get csrf_allowed_origins 2>/dev/null || true)"
-    [[ -z "${name}" ]] && name="WhiteDwarf"
-    cat > "${SUNSHINE_SAFE_CONFIG}" <<EOF_SAFE_CONF
-# Generated by plasmactl v${VERSION}
-# Purpose: stable fallback profile for KDE Wayland + KMS on iGPU.
-# 1080p/60-ready, H.264-only, no tray notifications, no app prep commands.
+    [[ -z "${name}" ]] && name="${default_host}"
+
+    cat > "${target_file}" <<EOF_SUNSHINE_CONF
+# Generated by plasmactl v${VERSION} (${profile_name} profile)
+# Purpose: ${profile_name} Sunshine profile for KDE Wayland + KMS capture.
 
 sunshine_name = ${name}
-min_log_level = debug
+min_log_level = ${min_log}
 system_tray = disabled
 
 address_family = ipv4
@@ -1351,29 +1211,46 @@ gamepad = auto
 high_resolution_scrolling = enabled
 native_pen_touch = enabled
 
-file_apps = $(basename "${SUNSHINE_SAFE_APPS}")
+file_apps = $(basename "${apps_file}")
 credentials_file = sunshine_state.json
 file_state = sunshine_state.json
-pkey = credentials/cakey.pem
-cert = credentials/cacert.pem
+pkey = ${SUNSHINE_CONFIG_DIR}/credentials/cakey.pem
+cert = ${SUNSHINE_CONFIG_DIR}/credentials/cacert.pem
 
 ${adapter:+adapter_name = ${adapter}
 }${output:+output_name = ${output}
-}capture = ${SUNSHINE_SAFE_CAPTURE}
-encoder = ${SUNSHINE_SAFE_ENCODER}
-hevc_mode = 1
-av1_mode = 1
-max_bitrate = ${SUNSHINE_SAFE_MAX_BITRATE}
-minimum_fps_target = ${SUNSHINE_SAFE_FPS_TARGET}
-fec_percentage = ${SUNSHINE_SAFE_FEC}
-qp = ${SUNSHINE_SAFE_QP}
-sw_preset = superfast
-sw_tune = zerolatency
-EOF_SAFE_CONF
+}capture = ${capture}
+encoder = ${encoder}
+hevc_mode = ${SUNSHINE_PERF_HEVC_MODE}
+av1_mode = ${SUNSHINE_PERF_AV1_MODE}
+max_bitrate = ${max_bitrate}
+minimum_fps_target = ${fps}
+fec_percentage = ${fec}
+qp = ${qp}
+EOF_SUNSHINE_CONF
+
+    # Append any extra profile-specific key=value settings
+    local extra
+    for extra in "$@"; do
+        echo "${extra}" >> "${target_file}"
+    done
 
     if [[ -n "${csrf}" ]]; then
-        printf 'csrf_allowed_origins = %s\n' "${csrf}" >> "${SUNSHINE_SAFE_CONFIG}"
+        printf 'csrf_allowed_origins = %s\n' "${csrf}" >> "${target_file}"
     fi
+}
+
+_write_sunshine_safe_assets() {
+    mkdir -p "${SUNSHINE_CONFIG_DIR}"
+    mkdir -p "${SUNSHINE_CONFIG_DIR}/credentials"
+
+    _write_sunshine_profile_conf \
+        "${SUNSHINE_SAFE_CONFIG}" "SAFE" "debug" \
+        "${SUNSHINE_SAFE_ENCODER}" "${SUNSHINE_SAFE_CAPTURE}" \
+        "${SUNSHINE_SAFE_MAX_BITRATE}" "${SUNSHINE_SAFE_FPS_TARGET}" \
+        "${SUNSHINE_SAFE_QP}" "${SUNSHINE_SAFE_FEC}" "${SUNSHINE_SAFE_APPS}" \
+        "sw_preset = superfast" \
+        "sw_tune = zerolatency"
 
     cat > "${SUNSHINE_SAFE_APPS}" <<'EOF_SAFE_APPS'
 {
@@ -1391,70 +1268,26 @@ EOF_SAFE_APPS
     log "Sunshine SAFE apps written:   ${SUNSHINE_SAFE_APPS}"
 }
 
-
 _write_sunshine_performance_assets() {
     mkdir -p "${SUNSHINE_CONFIG_DIR}"
-    local name adapter output csrf
-    name="$(_sunshine_conf_get sunshine_name 2>/dev/null || true)"
-    adapter="$(_selected_sunshine_adapter 2>/dev/null || true)"
-    output="$(_selected_sunshine_output 2>/dev/null || true)"
-    csrf="$(_sunshine_conf_get csrf_allowed_origins 2>/dev/null || true)"
-    [[ -z "${name}" ]] && name="WhiteDwarf"
-    cat > "${SUNSHINE_PERF_CONFIG}" <<EOF_PERF_CONF
-# Generated by plasmactl v${VERSION}
-# Purpose: performance profile for KDE Wayland + KMS on Intel iGPU.
-# Wired-LAN quality profile: VAAPI hardware encode on iGPU, low QP, high/client-controlled bitrate, AV1 disabled for UHD 630-class iGPU.
+    mkdir -p "${SUNSHINE_CONFIG_DIR}/credentials"
 
-sunshine_name = ${name}
-min_log_level = info
-system_tray = disabled
+    _write_sunshine_profile_conf \
+        "${SUNSHINE_PERF_CONFIG}" "PERFORMANCE" "info" \
+        "${SUNSHINE_PERF_ENCODER}" "${SUNSHINE_PERF_CAPTURE}" \
+        "${SUNSHINE_PERF_MAX_BITRATE}" "${SUNSHINE_PERF_FPS_TARGET}" \
+        "${SUNSHINE_PERF_QP}" "${SUNSHINE_PERF_FEC}" "${SUNSHINE_PERF_APPS}" \
+        "min_threads = ${SUNSHINE_PERF_MIN_THREADS}" \
+        "vaapi_strict_rc_buffer = ${SUNSHINE_PERF_VAAPI_STRICT_RC_BUFFER}" \
+        "vk_rc_mode = ${SUNSHINE_PERF_VK_RC_MODE}" \
+        "sw_preset = veryfast" \
+        "sw_tune = zerolatency"
 
-address_family = ipv4
-bind_address = 0.0.0.0
-port = 47989
-upnp = disabled
-lan_encryption_mode = 0
-wan_encryption_mode = 0
-ping_timeout = 30000
-
-keyboard = enabled
-mouse = enabled
-controller = enabled
-gamepad = auto
-high_resolution_scrolling = enabled
-native_pen_touch = enabled
-
-file_apps = $(basename "${SUNSHINE_PERF_APPS}")
-credentials_file = sunshine_state.json
-file_state = sunshine_state.json
-pkey = credentials/cakey.pem
-cert = credentials/cacert.pem
-
-${adapter:+adapter_name = ${adapter}
-}${output:+output_name = ${output}
-}capture = ${SUNSHINE_PERF_CAPTURE}
-encoder = ${SUNSHINE_PERF_ENCODER}
-hevc_mode = ${SUNSHINE_PERF_HEVC_MODE}
-av1_mode = ${SUNSHINE_PERF_AV1_MODE}
-max_bitrate = ${SUNSHINE_PERF_MAX_BITRATE}
-minimum_fps_target = ${SUNSHINE_PERF_FPS_TARGET}
-fec_percentage = ${SUNSHINE_PERF_FEC}
-qp = ${SUNSHINE_PERF_QP}
-min_threads = ${SUNSHINE_PERF_MIN_THREADS}
-vaapi_strict_rc_buffer = ${SUNSHINE_PERF_VAAPI_STRICT_RC_BUFFER}
-vk_rc_mode = ${SUNSHINE_PERF_VK_RC_MODE}
-sw_preset = veryfast
-sw_tune = zerolatency
-EOF_PERF_CONF
-
-    if [[ -n "${csrf}" ]]; then
-        printf 'csrf_allowed_origins = %s\n' "${csrf}" >> "${SUNSHINE_PERF_CONFIG}"
-    fi
-
+    # Fixed: Environment variable syntax for JSON apps file
     cat > "${SUNSHINE_PERF_APPS}" <<'EOF_PERF_APPS'
 {
   "env": {
-    "PATH": "$(PATH):$(HOME)/.local/bin"
+    "PATH": "$PATH:$HOME/.local/bin"
   },
   "apps": [
     {
@@ -1488,35 +1321,20 @@ _write_plasmactl_profile_manifest() {
 {
   "version": "${VERSION}",
   "active_profile": "${SUNSHINE_PROFILE}",
-  "notes": [
-    "Runtime config remains ~/.config/plasmactl.conf for shell-safe sourcing.",
-    "Generated Sunshine profiles are stored in ~/.config/sunshine/ and selected by SUNSHINE_PROFILE.",
-    "Clipboard is primarily controlled by Moonlight/client support; Sunshine has no documented clipboard config key in current LizardByte config docs. Keyboard and mouse input are enabled in both profiles."
-  ],
   "profiles": {
     "safe": {
       "sunshine_config": "${SUNSHINE_SAFE_CONFIG}",
       "apps_json": "${SUNSHINE_SAFE_APPS}",
-      "resolution_target": "1920x1080",
-      "fps_target": 60,
       "encoder": "${SUNSHINE_SAFE_ENCODER}",
       "capture": "${SUNSHINE_SAFE_CAPTURE}",
-      "max_bitrate_kbps": ${SUNSHINE_SAFE_MAX_BITRATE},
-      "codec_policy": "H264 only; HEVC/AV1 disabled for stability"
+      "max_bitrate_kbps": ${SUNSHINE_SAFE_MAX_BITRATE}
     },
     "performance": {
       "sunshine_config": "${SUNSHINE_PERF_CONFIG}",
       "apps_json": "${SUNSHINE_PERF_APPS}",
-      "resolution_target": "1920x1080 or client-requested",
-      "fps_target": 60,
       "encoder": "${SUNSHINE_PERF_ENCODER}",
       "capture": "${SUNSHINE_PERF_CAPTURE}",
-      "max_bitrate_kbps": ${SUNSHINE_PERF_MAX_BITRATE},
-      "qp": ${SUNSHINE_PERF_QP},
-      "fec_percentage": ${SUNSHINE_PERF_FEC},
-      "hevc_mode": ${SUNSHINE_PERF_HEVC_MODE},
-      "av1_mode": ${SUNSHINE_PERF_AV1_MODE},
-      "codec_policy": "VAAPI H264/HEVC auto; AV1 disabled for UHD 630-class iGPU; QP tuned for wired LAN quality"
+      "max_bitrate_kbps": ${SUNSHINE_PERF_MAX_BITRATE}
     }
   }
 }
@@ -1556,9 +1374,9 @@ _resolve_sunshine_config_effective() {
 _sunshine_command_line_for_log() {
     local cfg="${SUNSHINE_CONFIG_EFFECTIVE:-}" args="${SUNSHINE_ARGS_EFFECTIVE:-}"
     if [[ -n "${cfg}" ]]; then
-        printf '/usr/bin/sunshine %q %s' "${cfg}" "${args}"
+        printf '%s %q %s' "${SUNSHINE_BIN}" "${cfg}" "${args}"
     else
-        printf '/usr/bin/sunshine %s' "${args}"
+        printf '%s %s' "${SUNSHINE_BIN}" "${args}"
     fi
 }
 
@@ -1571,7 +1389,6 @@ _wait_sunshine_ready() {
     log "Sunshine: stream-ready${spid:+ (PID ${spid})}"
     _sunshine_listeners | sed 's/^/[sunshine-listener] /' || true
 }
-
 
 _journalctl_unit() {
     local unit="$1"; shift || true
@@ -1606,11 +1423,11 @@ _stop_sunshine_systemd_run() {
     while read -r unit; do
         [[ -n "${unit}" ]] || continue
         if [[ "${EUID}" -eq 0 ]]; then
-            systemctl stop "${unit}" >/dev/null 2>&1 || true
-            systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+            "${SYSTEMCTL_BIN}" stop "${unit}" >/dev/null 2>&1 || true
+            "${SYSTEMCTL_BIN}" reset-failed "${unit}" >/dev/null 2>&1 || true
         else
-            sudo -n systemctl stop "${unit}" >/dev/null 2>&1 || true
-            sudo -n systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+            sudo -n "${SYSTEMCTL_BIN}" stop "${unit}" >/dev/null 2>&1 || true
+            sudo -n "${SYSTEMCTL_BIN}" reset-failed "${unit}" >/dev/null 2>&1 || true
         fi
     done < <(_sunshine_systemd_known_units)
 }
@@ -1666,7 +1483,6 @@ _start_sunshine_systemd_run() {
 
     log "Starting Sunshine via systemd-run unit ${unit}.service..."
     vlog "  DeviceAllow card=${card_node} render=${render_node} driver=${driver}"
-    [[ -n "${libva}" ]] && vlog "  LIBVA_DRIVER_NAME=${libva}"
 
     local args=(
         --unit="${unit}"
@@ -1704,7 +1520,7 @@ _start_sunshine_systemd_run() {
         )
     fi
 
-    cmd=(/usr/bin/sunshine "${cfg}")
+    cmd=("${SUNSHINE_BIN}" "${cfg}")
 
     if [[ "${EUID}" -eq 0 ]]; then
         systemd-run "${args[@]}" "${cmd[@]}" >/dev/null || return 1
@@ -1726,7 +1542,7 @@ _start_sunshine_systemd_run() {
             ;;
         journal|soft|*)
             if ! _assert_sunshine_systemd_run_alignment "${unit}.service" "${journal_since}" "${card_node}" "${render_node}" "${driver}"; then
-                _warn "Sunshine systemd-run journal assertion not conclusive yet for ${unit}.service; leaving unit running for Moonlight launch test"
+                _warn "Sunshine systemd-run journal assertion not conclusive yet for ${unit}.service"
             fi
             ;;
     esac
@@ -1739,10 +1555,6 @@ _assert_sunshine_systemd_run_alignment() {
     card_base="$(basename "${card_node}")"
     render_base="$(basename "${render_node}")"
 
-    # Journal is the primary proof for systemd-run mode. Sunshine may open/close DRM
-    # fds during startup and may not keep the card fd open until a Moonlight launch.
-    # Killing the unit based on an early /proc fd snapshot caused v0.4.0 to tear down
-    # an otherwise working iGPU stream path.
     journal="$(_journalctl_unit "${unit}" --since "${since}")"
     if ! grep -Eq "/dev/dri/${card_base} -> ${driver}" <<<"${journal}"; then
         err "Sunshine journal does not yet show selected KMS device /dev/dri/${card_base} -> ${driver}"
@@ -1755,8 +1567,6 @@ _assert_sunshine_systemd_run_alignment() {
         return 1
     fi
 
-    # Diagnostic-only fd snapshot by default. It becomes reliable after a real
-    # Moonlight launch, but it is often empty before the first capture session.
     fds="$(sudo ls -l "/proc/${spid}/fd" 2>/dev/null | grep -E '/dev/dri|card|render' || true)"
     if [[ -n "${fds}" ]]; then
         if ! grep -q "${render_base}" <<<"${fds}"; then
@@ -1769,18 +1579,16 @@ _assert_sunshine_systemd_run_alignment() {
             return 1
         fi
     else
-        _warn "Sunshine PID ${spid} has no DRM fd visible yet; this can be normal before the first Moonlight launch"
+        _warn "Sunshine PID ${spid} has no DRM fd visible yet; this can be normal before first Moonlight launch"
     fi
 
     if _bool_true "${SUNSHINE_SYSTEMD_FD_ASSERT_STRICT}" || [[ "${SUNSHINE_SYSTEMD_ASSERT_MODE}" == "strict" ]]; then
         if ! grep -q "${card_base}" <<<"${fds}"; then
             err "Sunshine PID ${spid} has no fd for selected ${card_node}"
-            printf '%s\n' "${fds}" | sed 's/^/[sunshine-fd] /' >&2
             return 1
         fi
         if ! grep -q "${render_base}" <<<"${fds}"; then
             err "Sunshine PID ${spid} has no fd for selected render ${render_node}"
-            printf '%s\n' "${fds}" | sed 's/^/[sunshine-fd] /' >&2
             return 1
         fi
     fi
@@ -1805,14 +1613,12 @@ _start_sunshine_tmux() {
 
     _resolve_sunshine_config_effective || return 1
     SUNSHINE_ARGS_EFFECTIVE="${SUNSHINE_ARGS:-}"
-    # Sunshine 2026.516 does not support --cmd as a headless/trayless flag.
-    # It exits with: Fatal: Unknown command: cmd. Auto-ignore it to prevent regression.
     if [[ " ${SUNSHINE_ARGS_EFFECTIVE} " == *" --cmd "* ]]; then
         err "Ignoring SUNSHINE_ARGS=--cmd: this Sunshine build reports 'Fatal: Unknown command: cmd'."
         SUNSHINE_ARGS_EFFECTIVE="${SUNSHINE_ARGS_EFFECTIVE//--cmd/}"
     fi
     if [[ " ${SUNSHINE_ARGS_EFFECTIVE} " == *" --no-tray "* ]]; then
-        err "Ignoring SUNSHINE_ARGS=--no-tray: not supported/validated for this Sunshine build."
+        err "Ignoring SUNSHINE_ARGS=--no-tray: unsupported by this Sunshine build."
         SUNSHINE_ARGS_EFFECTIVE="${SUNSHINE_ARGS_EFFECTIVE//--no-tray/}"
     fi
     SUNSHINE_ARGS_EFFECTIVE="$(echo "${SUNSHINE_ARGS_EFFECTIVE}" | xargs 2>/dev/null || true)"
@@ -1844,10 +1650,10 @@ run_count=0
 while true; do
   if [[ -n "${SUNSHINE_CONFIG_EFFECTIVE}" ]]; then
     # shellcheck disable=SC2086
-    /usr/bin/sunshine "${SUNSHINE_CONFIG_EFFECTIVE}" ${SUNSHINE_ARGS_EFFECTIVE}
+    ${SUNSHINE_BIN} "${SUNSHINE_CONFIG_EFFECTIVE}" ${SUNSHINE_ARGS_EFFECTIVE}
   else
     # shellcheck disable=SC2086
-    /usr/bin/sunshine ${SUNSHINE_ARGS_EFFECTIVE}
+    ${SUNSHINE_BIN} ${SUNSHINE_ARGS_EFFECTIVE}
   fi
   rc=\$?
   printf '[plasmactl] %s sunshine exited rc=%s\n' "\$(date '+%Y-%m-%d %H:%M:%S')" "\$rc"
@@ -1866,7 +1672,7 @@ EOF_LAUNCHER
     chmod 700 "${launcher}"
 
     log "Starting Sunshine in tmux window '${SUNSHINE_WINDOW}' using launcher ${launcher}..."
-    tmux new-window -d -t "${SESSION}:" -n "${SUNSHINE_WINDOW}" "bash '${launcher}'"
+    _run_as_user "${TMUX_BIN}" new-window -d -t "${SESSION}:" -n "${SUNSHINE_WINDOW}" "bash '${launcher}'"
     _wait_sunshine_ready || return 1
     if ! _assert_sunshine_gpu_alignment_from_log; then
         _stop_sunshine_tmux_window || true
@@ -1879,16 +1685,16 @@ _start_sunshine_systemd() {
     journal_since="$(date '+%Y-%m-%d %H:%M:%S')"
     check_sunshine_exists || { err "Sunshine unit not found: ${SUNSHINE_UNIT}"; return 1; }
     _set_systemd_user_env_for_sunshine
-    systemctl --user reset-failed "${SUNSHINE_UNIT}" sunshine.service >/dev/null 2>&1 || true
+    _run_as_user "${SYSTEMCTL_BIN}" --user reset-failed "${SUNSHINE_UNIT}" sunshine.service >/dev/null 2>&1 || true
     if ! check_sunshine_enabled; then
         log "Sunshine not enabled — enabling on-demand..."
-        systemctl --user enable "${SUNSHINE_UNIT}" >/dev/null 2>&1 || vlog "Sunshine enable failed/non-fatal"
+        _run_as_user "${SYSTEMCTL_BIN}" --user enable "${SUNSHINE_UNIT}" >/dev/null 2>&1 || vlog "Sunshine enable non-fatal"
     fi
     log "Starting Sunshine via systemd user service..."
     if check_sunshine_service_active && _bool_true "${SUNSHINE_RESTART_ON_START}"; then
-        systemctl --user restart "${SUNSHINE_UNIT}" 2>/dev/null || true
+        _run_as_user "${SYSTEMCTL_BIN}" --user restart "${SUNSHINE_UNIT}" 2>/dev/null || true
     else
-        systemctl --user start "${SUNSHINE_UNIT}" 2>/dev/null || true
+        _run_as_user "${SYSTEMCTL_BIN}" --user start "${SUNSHINE_UNIT}" 2>/dev/null || true
     fi
     _wait_sunshine_ready
     _warn_if_sunshine_selected_vkms "${journal_since}"
@@ -1920,7 +1726,6 @@ _start_sunshine_supervised() {
     esac
 }
 
-
 _assert_sunshine_gpu_alignment_from_log() {
     _bool_true "${SUNSHINE_STRICT_GPU_ASSERT}" || return 0
     [[ -f "${SUNSHINE_TMUX_LOG}" ]] || return 0
@@ -1936,7 +1741,6 @@ _assert_sunshine_gpu_alignment_from_log() {
     sleep 1
     recent="$(tail -n 500 "${SUNSHINE_TMUX_LOG}" 2>/dev/null || true)"
 
-    # Parse the card Sunshine actually uses immediately after each "Screencasting with KMS" line.
     captures="$(awk '
         /Screencasting with KMS/ { want=1; next }
         want && /\/dev\/dri\/card[0-9]+ ->/ { print; want=0 }
@@ -1945,39 +1749,31 @@ _assert_sunshine_gpu_alignment_from_log() {
     if [[ -n "${captures}" ]] && ! grep -Fq "/dev/dri/${card} -> ${driver}" <<<"${captures}"; then
         err "Sunshine KMS capture is not using selected ${TARGET_DRM_DEVICE} (${driver})."
         err "Expected capture line: /dev/dri/${card} -> ${driver}"
-        err "Actual recent capture lines:"
         sed 's/^/  /' <<<"${captures}" >&2
         bad=true
     fi
 
     if [[ "${role}" == "igpu" ]]; then
-        if grep -Eiq 'vaapi vendor: .*AMD|vaapi vendor: .*Radeon|/dev/dri/card[0-9]+ -> amdgpu' <<<"${recent}"; then
-            # Allow enumeration lines if the selected capture is also present, but do not allow AMD VAAPI in iGPU mode.
-            if grep -Eiq 'vaapi vendor: .*AMD|vaapi vendor: .*Radeon' <<<"${recent}"; then
-                err "Sunshine is using AMD/Radeon VAAPI while iGPU role is enforced."
-                bad=true
-            fi
+        if grep -Eiq 'vaapi vendor: .*AMD|vaapi vendor: .*Radeon' <<<"${recent}"; then
+            err "Sunshine is using AMD/Radeon VAAPI while iGPU role is enforced."
+            bad=true
         fi
     elif [[ "${role}" == "dgpu" ]]; then
-        if grep -Eiq 'vaapi vendor: .*Intel|/dev/dri/card[0-9]+ -> i915|/dev/dri/card[0-9]+ -> xe' <<<"${recent}"; then
-            # DGPU mode may enumerate Intel, but encoding on Intel is not expected when adapter is selected.
-            if grep -Eiq 'vaapi vendor: .*Intel' <<<"${recent}"; then
-                err "Sunshine is using Intel VAAPI while dGPU role is enforced."
-                bad=true
-            fi
+        if grep -Eiq 'vaapi vendor: .*Intel' <<<"${recent}"; then
+            err "Sunshine is using Intel VAAPI while dGPU role is enforced."
+            bad=true
         fi
     fi
 
     if [[ "${bad}" == "true" ]]; then
-        err "Sunshine GPU assertion failed. adapter_name=${adapter:-unknown} output_name=${output:-unset} strict=${SUNSHINE_STRICT_GPU_ASSERT}"
-        err "This prevents the old false-positive state where Sunshine was online but captured the wrong GPU/TTY."
+        err "Sunshine GPU assertion failed. adapter_name=${adapter:-unknown} output_name=${output:-unset}"
         return 1
     fi
     return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# START / STOP
+# START / STOP COMMANDS
 # ─────────────────────────────────────────────────────────────────────────────
 
 cmd_start() {
@@ -1993,7 +1789,7 @@ cmd_start() {
     check_required_bins || exit 1
 
     log "Resolving Plasma DRM device..."
-    log "GPU role: $(_effective_gpu_role) (default=${PLASMA_GPU_DEFAULT}, override=${PLASMA_GPU_OVERRIDE:-none}, fallback=${PLASMA_GPU_ALLOW_FALLBACK})"
+    log "GPU role: $(_effective_gpu_role) (default=${PLASMA_GPU_DEFAULT}, override=${PLASMA_GPU_OVERRIDE:-none})"
     resolve_plasma_drm_device || exit 1
     log "Plasma DRM target: ${TARGET_DRM_DEVICE} ($(_target_driver 2>/dev/null || echo unknown))"
     _require_kms_output_ready || exit 1
@@ -2001,7 +1797,7 @@ cmd_start() {
     log "Checking ${TTY_NAME} loginctl session..."
     if ! check_tty_session; then
         err "No loginctl session on ${TTY_NAME}. Check getty@${TTY_NAME} autologin."
-        loginctl list-sessions --no-legend 2>&1 || true
+        "${LOGINCTL_BIN}" list-sessions --no-legend 2>&1 || true
         exit 1
     fi
     if ! check_tty_seat0; then
@@ -2014,11 +1810,11 @@ cmd_start() {
 
     log "Checking tmux session '${SESSION}'..."
     if ! check_tmux_session; then
-        err "tmux session '${SESSION}' not found. It should be created by ${TTY_NAME} autologin ~/.zprofile."
+        err "tmux session '${SESSION}' not found. Verify autologin / shell configuration."
         exit 1
     fi
     if ! check_tmux_attached; then
-        _warn "tmux session '${SESSION}' is not attached. Start may fail if it is no longer tied to ${TTY_NAME}."
+        _warn "tmux session '${SESSION}' is not attached."
     fi
     log "TMUX '${SESSION}': OK"
     _tmux_unlock_clients || true
@@ -2046,7 +1842,7 @@ cmd_start() {
 
         wait_for "kwin_wayland" "${WAIT_KWIN}" check_kwin || {
             err "KWin did not start on ${TARGET_DRM_DEVICE}. Capturing tmux pane:"
-            tmux capture-pane -pt "${SESSION}" -S -120 2>/dev/null | sed 's/^/[tmux] /' || true
+            _run_as_user "${TMUX_BIN}" capture-pane -pt "${SESSION}" -S -120 2>/dev/null | sed 's/^/[tmux] /' || true
             exit 1
         }
         local kpid
@@ -2059,7 +1855,7 @@ cmd_start() {
 
         wait_for "plasmashell" "${WAIT_PLASMA}" check_plasmashell || {
             err "plasmashell did not start. Capturing tmux pane:"
-            tmux capture-pane -pt "${SESSION}" -S -160 2>/dev/null | sed 's/^/[tmux] /' || true
+            _run_as_user "${TMUX_BIN}" capture-pane -pt "${SESSION}" -S -160 2>/dev/null | sed 's/^/[tmux] /' || true
             exit 1
         }
         log "plasmashell PID: $(_pid_first plasmashell)"
@@ -2075,15 +1871,14 @@ cmd_start() {
     log "─── plasmactl start: SUCCESS ───"
 }
 
-
 _tmux_unlock_clients() {
     check_tmux_session || return 0
     local clients c
-    clients="$(tmux list-clients -t "${SESSION}" -F '#{client_name}' 2>/dev/null || true)"
+    clients="$(_run_as_user "${TMUX_BIN}" list-clients -t "${SESSION}" -F '#{client_name}' 2>/dev/null || true)"
     [[ -n "${clients}" ]] || return 0
     while IFS= read -r c; do
         [[ -n "${c}" ]] || continue
-        tmux lock-client -U -t "${c}" >/dev/null 2>&1 || true
+        _run_as_user "${TMUX_BIN}" lock-client -U -t "${c}" >/dev/null 2>&1 || true
     done <<< "${clients}"
 }
 
@@ -2091,14 +1886,14 @@ _tmux_lock_clients() {
     check_tmux_session || return 0
     [[ "${LOCK_TMUX_ON_STOP}" == "true" || "${LOCK_TMUX_ON_STOP}" == "1" || "${LOCK_TMUX_ON_STOP}" == "yes" ]] || return 0
     log "Locking tmux session '${SESSION}' on physical tty..."
-    tmux lock-session -t "${SESSION}" >/dev/null 2>&1 || tmux lock-server >/dev/null 2>&1 || true
+    _run_as_user "${TMUX_BIN}" lock-session -t "${SESSION}" >/dev/null 2>&1 || _run_as_user "${TMUX_BIN}" lock-server >/dev/null 2>&1 || true
 }
 
 _tmux_kill_main_session_if_requested() {
     [[ "${KILL_TMUX_ON_STOP}" == "true" || "${KILL_TMUX_ON_STOP}" == "1" || "${KILL_TMUX_ON_STOP}" == "yes" ]] || return 0
     if check_tmux_session; then
         log "KILL_TMUX_ON_STOP=true: killing tmux session '${SESSION}'..."
-        tmux kill-session -t "${SESSION}" >/dev/null 2>&1 || true
+        _run_as_user "${TMUX_BIN}" kill-session -t "${SESSION}" >/dev/null 2>&1 || true
     fi
 }
 
@@ -2107,13 +1902,13 @@ _return_to_idle_tty_on_stop() {
     local n="${RETURN_TTY_NAME#tty}" target="${RETURN_TTY_NAME}"
     [[ "${n}" =~ ^[0-9]+$ ]] || { _warn "RETURN_TTY_NAME=${RETURN_TTY_NAME} is invalid; skipping VT return"; return 0; }
     log "Returning physical console to ${target} after stop..."
-    if _sudo /usr/bin/chvt "${n}" >/dev/null 2>&1; then
+    if _sudo "${CHVT_BIN}" "${n}" >/dev/null 2>&1; then
         sleep 0.5
         local active
         active="$(get_active_tty_name)"
         log "Active VT after stop: ${active:-unknown}"
     else
-        _warn "Could not chvt to ${target}. Add sudoers NOPASSWD for /usr/bin/chvt if needed."
+        _warn "Could not chvt to ${target}. Add sudoers NOPASSWD for ${CHVT_BIN} if needed."
     fi
 }
 
@@ -2123,7 +1918,7 @@ _terminate_tty_session_if_requested() {
     sid="$(get_tty_session_id || true)"
     [[ -n "${sid}" ]] || return 0
     log "TERMINATE_TTY_SESSION_ON_STOP=true: terminating loginctl session ${sid} (${TTY_NAME})..."
-    loginctl terminate-session "${sid}" >/dev/null 2>&1 || _sudo loginctl terminate-session "${sid}" >/dev/null 2>&1 || true
+    "${LOGINCTL_BIN}" terminate-session "${sid}" >/dev/null 2>&1 || _sudo "${LOGINCTL_BIN}" terminate-session "${sid}" >/dev/null 2>&1 || true
 }
 
 cmd_stop() {
@@ -2137,7 +1932,7 @@ cmd_stop() {
     _stop_sunshine_if_active
     _stop_plasma_processes
 
-    systemctl --user unset-environment WAYLAND_DISPLAY KWIN_DRM_DEVICES XDG_SESSION_TYPE XDG_CURRENT_DESKTOP KDE_FULL_SESSION 2>/dev/null || true
+    _run_as_user "${SYSTEMCTL_BIN}" --user unset-environment WAYLAND_DISPLAY KWIN_DRM_DEVICES XDG_SESSION_TYPE XDG_CURRENT_DESKTOP KDE_FULL_SESSION 2>/dev/null || true
     rm -f "${PLASMA_PID_FILE}" "${SUNSHINE_PID_FILE}" "${SESSION_ID_FILE}" "${WAYLAND_DISPLAY_FILE}"
 
     _tmux_lock_clients
@@ -2145,11 +1940,7 @@ cmd_stop() {
     _terminate_tty_session_if_requested
     _return_to_idle_tty_on_stop
 
-    if [[ "${KILL_TMUX_ON_STOP}" == "true" || "${KILL_TMUX_ON_STOP}" == "1" || "${KILL_TMUX_ON_STOP}" == "yes" ]]; then
-        log "State cleaned. ${TTY_NAME}/tmux kill requested."
-    else
-        log "State cleaned. ${TTY_NAME}/tmux preserved and locked when possible."
-    fi
+    log "State cleaned. ${TTY_NAME}/tmux preserved and locked when possible."
     log "─── plasmactl stop: SUCCESS ───"
 }
 
@@ -2162,7 +1953,7 @@ cmd_restart() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STATUS / DOCTOR / LIST / LOGS / DEBUG
+# STATUS / DOCTOR / LOGS / DIAGNOSTICS
 # ─────────────────────────────────────────────────────────────────────────────
 
 _st_ok()   { printf '\033[1;32mOK\033[0m\n'; }
@@ -2178,7 +1969,7 @@ cmd_status_inner() {
     _section "Session"
     printf '  %-24s ' "${TTY_NAME} loginctl:"; check_tty_session && _st_ok || { _st_fail; ready=false; }
     sid="$(get_tty_session_id || true)"
-    [[ -n "${sid}" ]] && echo "    session=${sid} seat=$(loginctl show-session "${sid}" -p Seat --value 2>/dev/null || echo '?') active=$(get_session_active_state "${sid}") active_vt=$(get_active_tty_name)"
+    [[ -n "${sid}" ]] && echo "    session=${sid} seat=$("${LOGINCTL_BIN}" show-session "${sid}" -p Seat --value 2>/dev/null || echo '?') active=$(get_session_active_state "${sid}") active_vt=$(get_active_tty_name)"
     printf '  %-24s ' "tmux ${SESSION}:"; check_tmux_session && _st_ok || { _st_fail; ready=false; }
 
     _section "Display"
@@ -2198,13 +1989,13 @@ cmd_status_inner() {
     echo "  profile: ${SUNSHINE_PROFILE}"
     echo "  config effective: ${SUNSHINE_CONFIG_EFFECTIVE:-default}"
     echo "  supervise: ${SUNSHINE_SUPERVISE}"
-    echo "  args: ${SUNSHINE_ARGS:-none}
-  effective args: ${SUNSHINE_ARGS_EFFECTIVE:-auto/empty}"
+    echo "  args: ${SUNSHINE_ARGS:-none}"
+
     if [[ "${SUNSHINE_START_MODE}" == "systemd-run" || "${SUNSHINE_START_MODE}" == "systemdrun" || "${SUNSHINE_START_MODE}" == "transient" ]]; then
         local sr_unit sr_pid
         sr_unit="$(_sunshine_systemd_unit_name).service"
         printf '  %-24s ' "systemd-run unit:"
-        if sudo -n systemctl is-active --quiet "${sr_unit}" 2>/dev/null; then
+        if sudo -n "${SYSTEMCTL_BIN}" is-active --quiet "${sr_unit}" 2>/dev/null; then
             _st_run; echo " ${sr_unit}"
         else
             _st_dead; echo " ${sr_unit}"; ready=false
@@ -2251,16 +2042,16 @@ cmd_doctor() {
     for bin in "${REQUIRED_BINS[@]}"; do
         command -v "${bin}" >/dev/null 2>&1 && _pass "${bin}" || { _fail "${bin}"; ((failures++)); }
     done
-    command -v sunshine >/dev/null 2>&1 && _pass "sunshine binary" || _warn "sunshine binary not in PATH; relying on user service"
+    command -v sunshine >/dev/null 2>&1 && _pass "sunshine binary" || _warn "sunshine binary not found in PATH"
     echo ""
 
     echo "Getty / ${TTY_NAME}"; echo "------------"
-    systemctl is-active --quiet "getty@${TTY_NAME}" && _pass "getty@${TTY_NAME} active" || { _fail "getty@${TTY_NAME} inactive"; ((failures++)); }
+    "${SYSTEMCTL_BIN}" is-active --quiet "getty@${TTY_NAME}" && _pass "getty@${TTY_NAME} active" || { _fail "getty@${TTY_NAME} inactive"; ((failures++)); }
     if check_tty_session; then
         sid="$(get_tty_session_id)"
         _pass "${TTY_NAME} loginctl session active (session ${sid})"
         check_tty_seat0 && _pass "${TTY_NAME} on seat0" || { _fail "${TTY_NAME} not on seat0"; ((failures++)); }
-        check_tty_active && _pass "${TTY_NAME} is active on seat0" || { _warn "${TTY_NAME} is not active now (active VT=$(get_active_tty_name)); start will try to activate it"; }
+        check_tty_active && _pass "${TTY_NAME} is active on seat0" || _warn "${TTY_NAME} is not active now (active VT=$(get_active_tty_name))"
     else
         _fail "no ${TTY_NAME} session in loginctl"; ((failures++))
     fi
@@ -2275,7 +2066,7 @@ cmd_doctor() {
                 local cd="/sys/class/drm/${cn}"
                 if [[ -d "${cd}" ]]; then
                     _info "driver=$(_card_driver "${cd}") vendor=$(_card_vendor "${cd}")"
-                    _is_vkms_card "${cd}" && _warn "selected target is VKMS/faux; real iGPU is preferred for this project"
+                    _is_vkms_card "${cd}" && _warn "selected target is VKMS/faux; real GPU is preferred"
                 fi
                 ;;
         esac
@@ -2283,10 +2074,6 @@ cmd_doctor() {
         _fail "No usable DRM target selected"; ((failures++))
     fi
     _print_drm_map
-    if ! _bool_true "${ALLOW_VKMS}" && [[ -n "$(_find_vkms_card 2>/dev/null || true)" ]]; then
-        _warn "VKMS/faux card is present while ALLOW_VKMS=false. Plasma target is real, but Sunshine may still choose VKMS for KMS capture."
-        _info "Recommended test: stop Plasma/Sunshine, remove /etc/modules-load.d/vkms.conf, unload vkms or reboot, then retest."
-    fi
     echo ""
 
     echo "TMUX"; echo "----"
@@ -2298,13 +2085,6 @@ cmd_doctor() {
     command -v sunshine >/dev/null 2>&1 && _pass "binary: $(command -v sunshine)" || { _fail "sunshine binary not found"; ((failures++)); }
     _info "start mode: ${SUNSHINE_START_MODE}"
     _info "profile: ${SUNSHINE_PROFILE}"
-    _info "safe config: ${SUNSHINE_SAFE_CONFIG}"
-    check_sunshine_exists && _pass "systemd unit present: ${SUNSHINE_UNIT}" || _warn "systemd unit not found (OK if using tmux mode and sunshine binary exists)"
-    check_sunshine_enabled && _pass "systemd service enabled" || _warn "systemd service not enabled"
-    if systemctl --user is-failed --quiet "${SUNSHINE_UNIT}" 2>/dev/null; then
-        _warn "systemd service is failed/start-limit-hit; tmux launcher is recommended/default"
-        ${FIX_MODE} && systemctl --user reset-failed "${SUNSHINE_UNIT}" sunshine.service >/dev/null 2>&1 || true
-    fi
     if check_sunshine_ready; then
         _pass "Sunshine stream-ready: process + TCP ${SUNSHINE_REQUIRED_TCP_PORTS}"
     elif check_sunshine_process; then
@@ -2326,13 +2106,13 @@ cmd_doctor() {
 
 cmd_list() {
     resolve_plasma_drm_device >/dev/null 2>&1 || true
-    echo ""; echo "=== loginctl sessions ==="; loginctl list-sessions 2>/dev/null || echo "(none)"
-    echo ""; echo "=== tmux sessions ==="; tmux ls 2>/dev/null || echo "(none)"
+    echo ""; echo "=== loginctl sessions ==="; "${LOGINCTL_BIN}" list-sessions 2>/dev/null || echo "(none)"
+    echo ""; echo "=== tmux sessions ==="; _run_as_user "${TMUX_BIN}" ls 2>/dev/null || echo "(none)"
     echo ""; echo "=== DRM device map ==="; _print_drm_map
     echo ""; echo "=== processes ==="
-    pgrep -fa 'startplasma-wayland|dbus-run-session|kwin_wayland|plasmashell|Xwayland|sunshine' 2>/dev/null || echo "(none)"
+    pgrep -u "${REAL_UID}" -fa 'startplasma-wayland|dbus-run-session|kwin_wayland|plasmashell|Xwayland|sunshine' 2>/dev/null || echo "(none)"
     echo ""; echo "=== sunshine service ==="
-    systemctl --user status "${SUNSHINE_UNIT}" --no-pager -l 2>&1 | sed -n '1,12p' || true
+    _run_as_user "${SYSTEMCTL_BIN}" --user status "${SUNSHINE_UNIT}" --no-pager -l 2>&1 | sed -n '1,12p' || true
     echo ""; echo "=== sunshine listeners ==="; _sunshine_listeners || true
     echo ""; echo "=== plasmactl state ==="; ls -lh "${STATE_DIR}/" 2>/dev/null || echo "(empty)"
     echo ""; echo "=== plasmactl logs ==="; ls -lh "${LOG_DIR}/" 2>/dev/null || echo "(empty)"
@@ -2346,9 +2126,9 @@ cmd_logs() {
         start) echo "=== start: ${START_LOG} ==="; _tail_file "${START_LOG}" ;;
         stop) echo "=== stop: ${STOP_LOG} ==="; _tail_file "${STOP_LOG}" ;;
         last) echo "=== last: ${LAST_LOG} ==="; _tail_file "${LAST_LOG}" ;;
-        sun*) echo "=== journalctl: ${SUNSHINE_UNIT} ==="; journalctl --user -u "${SUNSHINE_UNIT}" -n "${n}" --no-pager 2>/dev/null || true; echo ""; echo "=== tmux sunshine: ${SUNSHINE_TMUX_LOG} ==="; [[ -f "${SUNSHINE_TMUX_LOG}" ]] && tail -n "${n}" "${SUNSHINE_TMUX_LOG}" || true ;;
-        plasma|tmux) echo "=== tmux capture: ${SESSION} ==="; tmux capture-pane -pt "${SESSION}" -S "-${n}" 2>/dev/null || true ;;
-        systemd) echo "=== journalctl --user -b ==="; journalctl --user -b -n "${n}" --no-pager 2>/dev/null || true ;;
+        sun*) echo "=== journalctl: ${SUNSHINE_UNIT} ==="; _run_as_user journalctl --user -u "${SUNSHINE_UNIT}" -n "${n}" --no-pager 2>/dev/null || true; echo ""; echo "=== tmux sunshine: ${SUNSHINE_TMUX_LOG} ==="; [[ -f "${SUNSHINE_TMUX_LOG}" ]] && tail -n "${n}" "${SUNSHINE_TMUX_LOG}" || true ;;
+        plasma|tmux) echo "=== tmux capture: ${SESSION} ==="; _run_as_user "${TMUX_BIN}" capture-pane -pt "${SESSION}" -S "-${n}" 2>/dev/null || true ;;
+        systemd) echo "=== journalctl --user -b ==="; _run_as_user journalctl --user -b -n "${n}" --no-pager 2>/dev/null || true ;;
         all) ls -lh "${LOG_DIR}/" 2>/dev/null || true ;;
         *) echo "Usage: plasmactl logs [start|stop|last|sunshine|plasma|systemd|all] [N]" ;;
     esac
@@ -2368,24 +2148,21 @@ cmd_debug() {
         echo "RUNTIME_DIR=${RUNTIME_DIR}"
         echo ""
         echo "--- plasmactl config ---"; [[ -f "${CONFIG_FILE}" ]] && cat "${CONFIG_FILE}" || echo "(missing)"; echo ""
-        echo "--- sunshine default config ---"; [[ -f "${SUNSHINE_DEFAULT_CONFIG}" ]] && sed -n '1,220p' "${SUNSHINE_DEFAULT_CONFIG}" || echo "(missing)"; echo ""
         echo "--- sunshine safe config ---"; [[ -f "${SUNSHINE_SAFE_CONFIG}" ]] && sed -n '1,220p' "${SUNSHINE_SAFE_CONFIG}" || echo "(missing)"; echo ""
-        echo "--- sunshine safe apps ---"; [[ -f "${SUNSHINE_SAFE_APPS}" ]] && sed -n '1,220p' "${SUNSHINE_SAFE_APPS}" || echo "(missing)"; echo ""
         echo "--- /dev/dri ---"; ls -lh /dev/dri/ 2>&1 || true; echo ""
         echo "--- DRM map ---"; _print_drm_map; echo ""
-        echo "--- loginctl sessions ---"; loginctl list-sessions 2>&1 || true; echo ""
-        sid="$(get_tty_session_id || true)"; echo "--- loginctl show-session ${sid:-none} ---"; [[ -n "${sid}" ]] && loginctl show-session "${sid}" 2>&1 || true; echo ""
-        echo "--- tmux ls ---"; tmux ls 2>&1 || true; echo ""
-        echo "--- tmux pane ---"; tmux capture-pane -pt "${SESSION}" -S -250 2>&1 || true; echo ""
-        echo "--- process tree candidates ---"; pgrep -fa 'startplasma-wayland|dbus-run-session|kwin_wayland|plasmashell|Xwayland|sunshine' 2>&1 || true; echo ""
+        echo "--- loginctl sessions ---"; "${LOGINCTL_BIN}" list-sessions 2>&1 || true; echo ""
+        sid="$(get_tty_session_id || true)"; echo "--- loginctl show-session ${sid:-none} ---"; [[ -n "${sid}" ]] && "${LOGINCTL_BIN}" show-session "${sid}" 2>&1 || true; echo ""
+        echo "--- tmux ls ---"; _run_as_user "${TMUX_BIN}" ls 2>&1 || true; echo ""
+        echo "--- tmux pane ---"; _run_as_user "${TMUX_BIN}" capture-pane -pt "${SESSION}" -S -250 2>&1 || true; echo ""
+        echo "--- process tree ---"; pgrep -u "${REAL_UID}" -fa 'startplasma-wayland|dbus-run-session|kwin_wayland|plasmashell|Xwayland|sunshine' 2>&1 || true; echo ""
         echo "--- sunshine listeners ---"; _sunshine_listeners 2>&1 || true; echo ""
         kpid="$(get_kwin_pid_for_target 2>/dev/null || true)"; echo "--- kwin env (${kpid:-none}) ---"
         [[ -n "${kpid}" ]] && _pid_env "${kpid}" | grep -E 'DISPLAY|WAYLAND|DBUS|XDG|KWIN|KDE' || true; echo ""
         echo "--- runtime wayland sockets ---"; find "${RUNTIME_DIR}" -maxdepth 1 -type s -name 'wayland-*' -ls 2>&1 || true; echo ""
-        echo "--- systemd user env ---"; systemctl --user show-environment 2>&1 | grep -E 'DISPLAY|WAYLAND|DBUS|XDG|KWIN|KDE' || true; echo ""
-        echo "--- sunshine status ---"; systemctl --user status "${SUNSHINE_UNIT}" --no-pager -l 2>&1 || true; echo ""
-        echo "--- sunshine journal ---"; journalctl --user -u "${SUNSHINE_UNIT}" -n 140 --no-pager 2>&1 || true; echo ""
-        echo "--- user journal ---"; journalctl --user -b -n 220 --no-pager 2>&1 || true; echo ""
+        echo "--- systemd user env ---"; _run_as_user "${SYSTEMCTL_BIN}" --user show-environment 2>&1 | grep -E 'DISPLAY|WAYLAND|DBUS|XDG|KWIN|KDE' || true; echo ""
+        echo "--- sunshine status ---"; _run_as_user "${SYSTEMCTL_BIN}" --user status "${SUNSHINE_UNIT}" --no-pager -l 2>&1 || true; echo ""
+        echo "--- user journal ---"; _run_as_user journalctl --user -b -n 220 --no-pager 2>&1 || true; echo ""
         echo "--- state files ---"; ls -lh "${STATE_DIR}/" 2>&1 || true; echo ""
     } | tee "${debug_file}"
     echo "Saved: ${debug_file}"
@@ -2393,7 +2170,7 @@ cmd_debug() {
 
 cmd_cleanup() {
     _LOG_CTX="cleanup"
-    log "Cleaning up stale state files..."
+    log "Cleaning up state files..."
     rm -f "${PLASMA_PID_FILE}" "${SUNSHINE_PID_FILE}" "${SESSION_ID_FILE}" "${TARGET_DEVICE_FILE}" "${WAYLAND_DISPLAY_FILE}" "${LOCK_FILE}"
     log "Done."
     ls -lh "${STATE_DIR}/" 2>/dev/null || true
@@ -2401,7 +2178,7 @@ cmd_cleanup() {
 
 cmd_attach() {
     check_tmux_session || { err "tmux session '${SESSION}' not found"; exit 1; }
-    exec tmux attach -t "${SESSION}"
+    exec _run_as_user "${TMUX_BIN}" attach -t "${SESSION}"
 }
 
 cmd_sunshine_safe() {
@@ -2413,29 +2190,23 @@ cmd_sunshine_safe() {
     echo "  ${SUNSHINE_SAFE_CONFIG}"
     echo "  ${SUNSHINE_SAFE_APPS}"
     echo "  ${PLASMACTL_PROFILE_MANIFEST}"
-    echo ""
-    echo "Use this in ~/.config/plasmactl.conf:"
-    cat <<EOF_SAFE_USAGE
-SUNSHINE_PROFILE=safe
-SUNSHINE_START_MODE=systemd-run
-SUNSHINE_SUPERVISE=true
-SUNSHINE_REQUIRED_TCP_PORTS="47990 48010"
-EOF_SAFE_USAGE
 }
 
 cmd_sunshine_profiles() {
     _LOG_CTX="sunshine-profiles"
     _write_all_profile_assets
     echo ""
-    echo "Generated Sunshine/plasmactl profile files:"
+    echo "Generated Sunshine profiles:"
     echo "  SAFE config:        ${SUNSHINE_SAFE_CONFIG}"
     echo "  SAFE apps:          ${SUNSHINE_SAFE_APPS}"
     echo "  PERFORMANCE config: ${SUNSHINE_PERF_CONFIG}"
     echo "  PERFORMANCE apps:   ${SUNSHINE_PERF_APPS}"
     echo "  Manifest:           ${PLASMACTL_PROFILE_MANIFEST}"
-    echo ""
-    echo "Switch profile with: SUNSHINE_PROFILE=safe or SUNSHINE_PROFILE=performance in ${CONFIG_FILE}"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SETUP & SYSTEM INTEGRATION
+# ─────────────────────────────────────────────────────────────────────────────
 
 cmd_setup() {
     _LOG_CTX="setup"
@@ -2449,7 +2220,7 @@ REQUIRE_CONNECTED_OUTPUT_ON_START=true
 HEADLESS_MODE=none
 HEADLESS_FORCE_OUTPUT=HDMI-A-1
 HEADLESS_FORCE_MODE=1920x1080@60
-HEADLESS_EDID_FILE=white_1080p.bin
+HEADLESS_EDID_FILE=edid_1080p.bin
 
 ACTIVATE_TTY_ON_START=true
 REQUIRE_ACTIVE_TTY_ON_START=true
@@ -2468,6 +2239,8 @@ SUNSHINE_SUPERVISE_MAX_RESTARTS=10
 SUNSHINE_SUPERVISE_RESTART_DELAY=2
 SUNSHINE_RESTART_ON_START=true
 SUNSHINE_REQUIRED_TCP_PORTS="47990 48010"
+SUNSHINE_TCP_PORTS="47984 47989 47990 48010"
+SUNSHINE_UDP_PORTS="47998 47999 48000 48010"
 SUNSHINE_ARGS=
 EOF_DEFAULT_CONF
         log "Default config created: ${CONFIG_FILE}"
@@ -2478,43 +2251,55 @@ EOF_DEFAULT_CONF
     _write_all_profile_assets
 
     if [[ "${1:-}" == "--system" ]]; then
-        log "Installing optional system integration for getty@${TTY_NAME}, tmux autologin, and sudoers..."
+        log "Installing system integration for getty@${TTY_NAME}, tmux autologin, and sudoers..."
         _priv mkdir -p "/etc/systemd/system/getty@${TTY_NAME}.service.d"
         _priv tee "/etc/systemd/system/getty@${TTY_NAME}.service.d/override.conf" >/dev/null <<EOF_GETTY
 [Service]
 ExecStart=
 ExecStart=-/sbin/agetty --autologin ${REAL_USER} --noclear %I \$TERM
 EOF_GETTY
-        if ! grep -q 'BEGIN plasmactl tty2 tmux autostart' "${REAL_HOME}/.zprofile" 2>/dev/null; then
-            cat >> "${REAL_HOME}/.zprofile" <<'EOF_ZPROFILE'
 
-# BEGIN plasmactl tty2 tmux autostart
-if [[ "$(tty)" == "/dev/tty2" ]]; then
-    if ! tmux has-session -t plasma 2>/dev/null; then
-        tmux new-session -d -s plasma
-    fi
-    exec tmux attach -t plasma
-fi
-# END plasmactl tty2 tmux autostart
-EOF_ZPROFILE
-            log "Added plasmactl tmux autostart block to ~/.zprofile"
+        # Detect target user's default login shell profile
+        local user_shell profile_target
+        user_shell="$(getent passwd "${REAL_USER}" | cut -d: -f7 || echo "/bin/bash")"
+        if [[ "${user_shell}" == *"/zsh" ]]; then
+            profile_target="${REAL_HOME}/.zprofile"
+        elif [[ -f "${REAL_HOME}/.bash_profile" ]]; then
+            profile_target="${REAL_HOME}/.bash_profile"
         else
-            log "~/.zprofile already contains plasmactl autostart block"
+            profile_target="${REAL_HOME}/.profile"
         fi
+
+        if ! grep -q 'BEGIN plasmactl tmux autostart' "${profile_target}" 2>/dev/null; then
+            cat >> "${profile_target}" <<EOF_SHELL_PROFILE
+
+# BEGIN plasmactl tmux autostart
+if [[ "\$(tty)" == "/dev/${TTY_NAME}" ]]; then
+    if ! tmux has-session -t ${SESSION} 2>/dev/null; then
+        tmux new-session -d -s ${SESSION}
+    fi
+    exec tmux attach -t ${SESSION}
+fi
+# END plasmactl tmux autostart
+EOF_SHELL_PROFILE
+            log "Added plasmactl tmux autostart block to ${profile_target}"
+        else
+            log "${profile_target} already contains plasmactl autostart block"
+        fi
+
         _priv tee /etc/sudoers.d/plasmactl >/dev/null <<EOF_SUDOERS
-${REAL_USER} ALL=(root) NOPASSWD: /usr/bin/chvt, /usr/bin/loginctl, /usr/bin/systemctl, /usr/bin/systemd-run
+${REAL_USER} ALL=(root) NOPASSWD: ${CHVT_BIN}, ${LOGINCTL_BIN}, ${SYSTEMCTL_BIN}, /usr/bin/systemd-run, /usr/bin/journalctl
 EOF_SUDOERS
         _priv chmod 440 /etc/sudoers.d/plasmactl
-        _priv systemctl daemon-reload
-        _priv systemctl restart "getty@${TTY_NAME}" || true
-        log "System integration applied. A reboot is recommended for a clean validation."
+        _priv "${SYSTEMCTL_BIN}" daemon-reload
+        _priv "${SYSTEMCTL_BIN}" restart "getty@${TTY_NAME}" || true
+        log "System integration applied successfully."
     else
         echo ""
-        echo "Optional fresh-install system integration: plasmactl setup --system"
-        echo "This configures getty@${TTY_NAME} autologin, ~/.zprofile tmux attach, and sudoers for chvt/loginctl/systemctl."
+        echo "Fresh-install system integration available: plasmactl setup --system"
+        echo "Configures getty@${TTY_NAME} autologin, user shell tmux autostart, and sudoers privileges."
     fi
 }
-
 
 cmd_headless_check() {
     _LOG_CTX="headless-check"
@@ -2524,15 +2309,10 @@ cmd_headless_check() {
     echo "PLASMA_DRM_DEVICE_AUTO_FALLBACK=${PLASMA_DRM_DEVICE_AUTO_FALLBACK}"
     echo "ALLOW_VKMS=${ALLOW_VKMS}"
     echo "PLASMA_GPU_DEFAULT=${PLASMA_GPU_DEFAULT}"
-    echo "PLASMA_GPU_OVERRIDE=${PLASMA_GPU_OVERRIDE:-none}"
-    echo "PLASMA_GPU_ALLOW_FALLBACK=${PLASMA_GPU_ALLOW_FALLBACK}"
-    echo "PLASMA_GPU_IGPU_DRIVERS=${PLASMA_GPU_IGPU_DRIVERS}"
-    echo "PLASMA_GPU_DGPU_DRIVERS=${PLASMA_GPU_DGPU_DRIVERS}"
     echo "HEADLESS_MODE=${HEADLESS_MODE}"
     echo "HEADLESS_FORCE_OUTPUT=${HEADLESS_FORCE_OUTPUT}"
     echo "HEADLESS_FORCE_MODE=${HEADLESS_FORCE_MODE}"
     echo "HEADLESS_EDID_FILE=${HEADLESS_EDID_FILE}"
-    echo "REQUIRE_CONNECTED_OUTPUT_ON_START=${REQUIRE_CONNECTED_OUTPUT_ON_START}"
     echo ""
     echo "=== kernel cmdline ==="
     cat /proc/cmdline 2>/dev/null || true
@@ -2562,26 +2342,15 @@ cmd_headless_check() {
     else
         cat <<EOF_HEADLESS
 Result: no DRM connector reports connected.
-
-For this Plasma+KWin+Sunshine KMS architecture, a real streamable desktop needs an active KMS output/CRTC.
-Without a monitor/dummy, the script can start pieces of the session, but it cannot invent a real iGPU output for KMS capture by itself.
+For this Plasma+KWin+Sunshine KMS architecture, a connected KMS output/CRTC is required.
 
 Viable headless options:
-  1) Recommended/reliable: HDMI/DP dummy plug on the iGPU.
-  2) Possible but kernel/BIOS-dependent: force a connector and EDID at boot.
-     First identify the connector name when a monitor is attached, e.g. HDMI-A-1 from /sys/class/drm/card*-HDMI-A-1.
-     Then use kernel parameters similar to:
-       drm.edid_firmware=${HEADLESS_FORCE_OUTPUT}:edid/${HEADLESS_EDID_FILE} video=${HEADLESS_FORCE_OUTPUT}:${HEADLESS_FORCE_MODE}e
-     The EDID file must exist under /usr/lib/firmware/edid/ or /lib/firmware/edid/ and initramfs may need rebuilding.
-  3) Different architecture: VKMS/virtual display. This is not the same as the current iGPU KMS path and may require separate Sunshine/Plasma tuning.
-
-Current best config for physical/dummy output:
-  PLASMA_DRM_DEVICE=auto
-  PLASMA_DRM_DEVICE_AUTO_FALLBACK=true
+  1) Recommended: HDMI/DP dummy plug on target GPU.
+  2) Force EDID via kernel parameters:
+     drm.edid_firmware=${HEADLESS_FORCE_OUTPUT}:edid/${HEADLESS_EDID_FILE} video=${HEADLESS_FORCE_OUTPUT}:${HEADLESS_FORCE_MODE}e
 EOF_HEADLESS
     fi
 }
-
 
 cmd_headless_edid() {
     _LOG_CTX="headless-edid"
@@ -2613,8 +2382,6 @@ cmd_headless_edid() {
             echo ""
             echo "=== installed EDID files ==="
             ls -lh /usr/lib/firmware/edid 2>/dev/null || echo "  (none under /usr/lib/firmware/edid)"
-            echo ""
-            cmd_headless_edid "headless-edid" params
             ;;
         params)
             short="${connector_arg:-${HEADLESS_FORCE_OUTPUT}}"
@@ -2622,16 +2389,10 @@ cmd_headless_edid() {
             params="drm.edid_firmware=${short}:edid/${HEADLESS_EDID_FILE} video=${short}:${HEADLESS_FORCE_MODE}e"
             echo "Kernel params for forced EDID:"
             echo "  ${params}"
-            echo ""
-            echo "mkinitcpio FILES entry:"
-            echo "  FILES=(/usr/lib/firmware/edid/${HEADLESS_EDID_FILE})"
-            echo ""
-            echo "After applying bootloader params and mkinitcpio, reboot and verify:"
-            echo "  plasmactl headless-check"
             ;;
         capture)
             connector="${connector_arg:-$(_first_connected_connector || true)}"
-            [[ -n "${connector}" ]] || { err "No connected connector found to capture EDID from. Connect a monitor/dummy first."; return 1; }
+            [[ -n "${connector}" ]] || { err "No connected connector found to capture EDID from."; return 1; }
             sysfs="$(_connector_sysfs_path "${connector}" || true)"
             [[ -n "${sysfs}" && -r "${sysfs}/edid" ]] || { err "EDID not readable for connector ${connector}"; return 1; }
             local bytes
@@ -2639,86 +2400,48 @@ cmd_headless_edid() {
             [[ "${bytes}" -gt 0 ]] || { err "Connector ${connector} has empty EDID."; return 1; }
             short="$(_connector_short_name "$(basename "${sysfs}")")"
             dest="/usr/lib/firmware/edid/${edid_file}"
-            log "Capturing EDID from $(basename "${sysfs}") (${short}, ${bytes} bytes) to ${dest}..."
+            log "Capturing EDID from $(basename "${sysfs}") to ${dest}..."
             sudo mkdir -p /usr/lib/firmware/edid
             sudo cp "${sysfs}/edid" "${dest}"
             sudo chmod 0644 "${dest}"
             echo "Captured: ${dest}"
-            echo ""
-            echo "Recommended ~/.config/plasmactl.conf entries:"
-            echo "  HEADLESS_MODE=kernel-forced-edid"
-            echo "  HEADLESS_FORCE_OUTPUT=${short}"
-            echo "  HEADLESS_FORCE_MODE=${HEADLESS_FORCE_MODE}"
-            echo "  HEADLESS_EDID_FILE=${edid_file}"
-            echo ""
-            echo "Recommended kernel params:"
-            echo "  drm.edid_firmware=${short}:edid/${edid_file} video=${short}:${HEADLESS_FORCE_MODE}e"
-            echo ""
-            echo "Remember to include the EDID in initramfs if your distro needs it:"
-            echo "  FILES=(/usr/lib/firmware/edid/${edid_file})"
-            echo "  sudo mkinitcpio -P"
             ;;
         install-limine|apply-limine)
             short="${connector_arg:-${HEADLESS_FORCE_OUTPUT}}"
             short="$(_connector_short_name "${short}")"
             edid_file="${file_arg:-${HEADLESS_EDID_FILE}}"
             dest="/usr/lib/firmware/edid/${edid_file}"
-            [[ -r "${dest}" ]] || { err "EDID file not found/readable: ${dest}. Run headless-edid capture first."; return 1; }
+            [[ -r "${dest}" ]] || { err "EDID file not found: ${dest}. Run headless-edid capture first."; return 1; }
             params="drm.edid_firmware=${short}:edid/${edid_file} video=${short}:${HEADLESS_FORCE_MODE}e"
             echo "Applying Limine forced-EDID params: ${params}"
             if [[ ! -f /etc/default/limine ]]; then
-                err "/etc/default/limine not found. This helper is only for CachyOS/Limine."
+                err "/etc/default/limine not found."
                 return 1
             fi
             sudo cp /etc/default/limine "/etc/default/limine.bak.$(date +%Y%m%d-%H%M%S)"
             if ! grep -Fq "drm.edid_firmware=${short}:edid/${edid_file}" /etc/default/limine; then
                 if grep -q '^KERNEL_CMDLINE\[default\]+=' /etc/default/limine; then
-                    sudo sed -i "/^KERNEL_CMDLINE\[default\]+=/{s/"$/ ${params}"/}" /etc/default/limine
+                    # Fixed sed escaping for double-quoted regex
+                    sudo sed -i "/^KERNEL_CMDLINE\[default\]+=/{s/\"$/ ${params}\"/}" /etc/default/limine
                 else
-                    printf 'KERNEL_CMDLINE[default]+="%s"
-' "${params}" | sudo tee -a /etc/default/limine >/dev/null
+                    printf 'KERNEL_CMDLINE[default]+="%s"\n' "${params}" | sudo tee -a /etc/default/limine >/dev/null
                 fi
             else
-                echo "Limine already contains forced-EDID param."
+                echo "Limine configuration already contains forced-EDID param."
             fi
-            if [[ -f /etc/mkinitcpio.conf ]]; then
-                sudo cp /etc/mkinitcpio.conf "/etc/mkinitcpio.conf.bak.$(date +%Y%m%d-%H%M%S)"
-                if grep -q '^FILES=' /etc/mkinitcpio.conf; then
-                    if ! grep -Fq "${dest}" /etc/mkinitcpio.conf; then
-                        sudo sed -i -E "s|^FILES=\((.*)\)|FILES=(\1 ${dest})|" /etc/mkinitcpio.conf
-                    fi
-                else
-                    printf 'FILES=(%s)
-' "${dest}" | sudo tee -a /etc/mkinitcpio.conf >/dev/null
-                fi
-            else
-                echo "WARN: /etc/mkinitcpio.conf not found; ensure EDID is included in initramfs by your distro tooling." >&2
-            fi
-            if command -v limine-mkinitcpio >/dev/null 2>&1; then
-                sudo limine-mkinitcpio
-            else
-                sudo mkinitcpio -P
-            fi
-            echo "Done. Reboot without monitor and run: plasmactl headless-check && plasmactl start --verbose"
             ;;
         *)
             cat <<EOF_EDID_USAGE
 Usage:
   plasmactl headless-edid status
   plasmactl headless-edid params [HDMI-A-1]
-  plasmactl headless-edid capture [card1-HDMI-A-1|HDMI-A-1] [white_1080p.bin]
-  plasmactl headless-edid install-limine [HDMI-A-1] [white_1080p.bin]
-
-Notes:
-  capture requires a real monitor/dummy connected once, so the kernel can expose a valid EDID.
-  This command copies EDID into /usr/lib/firmware/edid/ and prints kernel parameters.
-  It does not blindly edit your bootloader, because CachyOS setups may use Limine, GRUB, or systemd-boot.
+  plasmactl headless-edid capture [card1-HDMI-A-1|HDMI-A-1] [edid_1080p.bin]
+  plasmactl headless-edid install-limine [HDMI-A-1] [edid_1080p.bin]
 EOF_EDID_USAGE
             return 1
             ;;
     esac
 }
-
 
 cmd_config_template() {
     mkdir -p "${PLASMACTL_PROFILE_DIR}"
@@ -2744,7 +2467,7 @@ cmd_config_template() {
     "mode": "kernel-forced-edid",
     "force_output": "HDMI-A-1",
     "force_mode": "1920x1080@60",
-    "edid_file": "white_1080p.bin"
+    "edid_file": "edid_1080p.bin"
   },
   "tty": {
     "activate_on_start": true,
@@ -2804,7 +2527,6 @@ cmd_config_template() {
 }
 EOF_JSON_TEMPLATE
     echo "Wrote JSON config template: ${PLASMACTL_JSON_CONFIG}"
-    echo "Requires jq for runtime JSON overlay. Classic config remains: ${CONFIG_FILE}"
 }
 
 cmd_sanity() {
@@ -2837,15 +2559,7 @@ cmd_sanity() {
     echo "sunshine_output_effective=$(_selected_sunshine_output 2>/dev/null || echo unset)"
     echo "sunshine_strict_gpu_assert=${SUNSHINE_STRICT_GPU_ASSERT}"
     if [[ -n "${render}" && -n "${adapter}" && "${adapter}" != "${render}" ]]; then
-        echo "WARN: Sunshine adapter_name differs from selected DRM render node. Use SUNSHINE_ADAPTER_MODE=auto or set SUNSHINE_ADAPTER_NAME explicitly."
-    fi
-    if [[ -n "${PLASMA_DRM_REQUIRE_DRIVER}" && "${driver}" != "${PLASMA_DRM_REQUIRE_DRIVER}" ]]; then
-        echo "FAIL: selected driver does not match PLASMA_DRM_REQUIRE_DRIVER=${PLASMA_DRM_REQUIRE_DRIVER}"
-    fi
-    if [[ "$(_effective_gpu_role)" != "auto" ]] && ! _bool_true "${PLASMA_GPU_ALLOW_FALLBACK}"; then
-        if [[ -n "${driver}" ]] && ! _driver_list_contains "${driver}" "$(_gpu_role_drivers)"; then
-            echo "FAIL: selected driver does not match enforced GPU role $(_effective_gpu_role) (allowed: $(_gpu_role_drivers))"
-        fi
+        echo "WARN: Sunshine adapter_name differs from selected DRM render node."
     fi
 }
 
@@ -2856,9 +2570,6 @@ cmd_config_snapshot() {
     echo "=== plasmactl JSON config ==="
     [[ -f "${PLASMACTL_JSON_CONFIG}" ]] && sed -n '1,260p' "${PLASMACTL_JSON_CONFIG}" || echo "(missing: ${PLASMACTL_JSON_CONFIG})"
     echo ""
-    echo "=== sunshine default config ==="
-    [[ -f "${SUNSHINE_DEFAULT_CONFIG}" ]] && sed -n '1,240p' "${SUNSHINE_DEFAULT_CONFIG}" || echo "(missing: ${SUNSHINE_DEFAULT_CONFIG})"
-    echo ""
     echo "=== sunshine safe config ==="
     [[ -f "${SUNSHINE_SAFE_CONFIG}" ]] && sed -n '1,240p' "${SUNSHINE_SAFE_CONFIG}" || echo "(missing: ${SUNSHINE_SAFE_CONFIG})"
     echo ""
@@ -2867,12 +2578,7 @@ cmd_config_snapshot() {
     echo ""
     echo "=== plasmactl profile manifest ==="
     [[ -f "${PLASMACTL_PROFILE_MANIFEST}" ]] && sed -n '1,240p' "${PLASMACTL_PROFILE_MANIFEST}" || echo "(missing: ${PLASMACTL_PROFILE_MANIFEST})"
-    echo ""
-    echo "=== sunshine apps ==="
-    [[ -f "${SUNSHINE_CONFIG_DIR}/apps.json" ]] && sed -n '1,240p' "${SUNSHINE_CONFIG_DIR}/apps.json" || echo "(missing apps.json)"
 }
-
-
 
 _proc_fd_lines() {
     local pid="$1"
@@ -2899,9 +2605,9 @@ _proc_user_name() {
 _unit_main_pid() {
     local unit="$1" pid
     if [[ "${EUID}" -eq 0 ]]; then
-        pid="$(systemctl show -p MainPID --value "${unit}" 2>/dev/null || true)"
+        pid="$("${SYSTEMCTL_BIN}" show -p MainPID --value "${unit}" 2>/dev/null || true)"
     else
-        pid="$(sudo -n systemctl show -p MainPID --value "${unit}" 2>/dev/null || systemctl show -p MainPID --value "${unit}" 2>/dev/null || true)"
+        pid="$(sudo -n "${SYSTEMCTL_BIN}" show -p MainPID --value "${unit}" 2>/dev/null || "${SYSTEMCTL_BIN}" show -p MainPID --value "${unit}" 2>/dev/null || true)"
     fi
     [[ "${pid}" =~ ^[0-9]+$ && "${pid}" != "0" ]] && echo "${pid}"
 }
@@ -2920,10 +2626,8 @@ _list_processes_using_gpu_nodes() {
         any=true
         user="$(_proc_user_name "${pid}")"
         cmd="$(_proc_cmdline_short "${pid}")"
-        printf 'pid=%-8s user=%-12s cmd=%s
-' "${pid}" "${user}" "${cmd}"
-        printf '%s
-' "${fds}" | sed 's/^/  fd: /'
+        printf 'pid=%-8s user=%-12s cmd=%s\n' "${pid}" "${user}" "${cmd}"
+        printf '%s\n' "${fds}" | sed 's/^/  fd: /'
     done
     ${any} || echo "(no visible processes currently hold these DRM nodes)"
 }
@@ -2964,7 +2668,7 @@ cmd_confirm_gpu() {
 
     echo ""
     echo "### KWin assertion"
-    kwpid="$(pgrep -u "${REAL_USER}" -x kwin_wayland | head -1 || true)"
+    kwpid="$(pgrep -u "${REAL_UID}" -x kwin_wayland 2>/dev/null | head -n 1 || true)"
     echo "kwin_pid=${kwpid:-none}"
     if [[ -n "${kwpid}" ]]; then
         envdev="$(tr '\0' '\n' < "/proc/${kwpid}/environ" 2>/dev/null | awk -F= '/^KWIN_DRM_DEVICES=/{print $2; exit}' || true)"
@@ -2981,8 +2685,7 @@ cmd_confirm_gpu() {
     echo ""
     echo "### Sunshine assertion"
     if [[ -n "${journal}" ]]; then
-        printf '%s
-' "${journal}" | grep -Ei 'Operation not permitted|/dev/dri/card|Screencasting|KMS|monitor|connector|encoder|vaapi|Intel|AMD|Radeon|Fatal|Error' | tail -n 120 || true
+        printf '%s\n' "${journal}" | grep -Ei 'Operation not permitted|/dev/dri/card|Screencasting|KMS|monitor|connector|encoder|vaapi|Intel|AMD|Radeon|Fatal|Error' | tail -n 120 || true
     else
         echo "journal_unavailable_or_empty"
     fi
@@ -3073,7 +2776,7 @@ cmd_gpu_assert() {
         echo "FAIL: Sunshine adapter does not match selected card render node"
         ok=false
     fi
-    kwpid="$(pgrep -u "${REAL_USER}" -x kwin_wayland | head -1 || true)"
+    kwpid="$(pgrep -u "${REAL_UID}" -x kwin_wayland 2>/dev/null | head -n 1 || true)"
     echo "kwin_pid=${kwpid:-none}"
     if [[ -n "${kwpid}" ]]; then
         local envdev
@@ -3099,46 +2802,42 @@ Flags:
   --fix          Used with doctor where applicable
 
 Commands:
-  start           Launch Plasma + Sunshine on selected real DRM target (v0.4: Sunshine via systemd-run by default)
-  stop            Stop Sunshine/Plasma and lock the physical tmux console when possible
+  start           Launch Plasma + Sunshine on selected real DRM target
+  stop            Stop Sunshine/Plasma and lock physical tmux console
   restart         stop + start
   status          Health check all components
   doctor          Diagnose prerequisites
   detect-gpu      Show DRM device map and selected target
-  headless-check  Diagnose no-monitor/no-dummy KMS viability and show forced-EDID hints
-  headless-edid   status|params|capture|install-limine EDID helper for no-monitor boot
+  headless-check  Diagnose no-monitor/no-dummy KMS viability
+  headless-edid   status|params|capture|install-limine EDID helper
   list            Sessions, tmux, DRM, processes, services, state
   logs            logs [start|stop|last|sunshine|plasma|systemd|all] [N]
   debug           Full diagnostic snapshot → ${DEBUG_DIR}/
   cleanup         Remove stale PID/lock/device cache files
   attach          Attach to tmux session '${SESSION}'
-  sunshine-safe      Generate SAFE Sunshine profile/config
-  sunshine-profiles  Generate SAFE + PERFORMANCE Sunshine profiles and manifest
-  setup [--system]   Create default config/profiles; --system also configures getty/tmux/sudoers
-  config-snapshot    Show plasmactl + Sunshine configs/apps
-  config-template    Write optional JSON overlay config template
-  sanity             Full post-boot runtime sanity check
-  gpu-assert         Verify selected GPU role/driver/render and running KWin/Sunshine alignment
-  confirm-gpu        Confirm selected GPU isolation: confirm-gpu [igpu|dgpu|auto]
-  confirm-igpu       Alias for confirm-gpu igpu
-  confirm-dgpu       Alias for confirm-gpu dgpu
+  sunshine-safe   Generate SAFE Sunshine profile/config
+  sunshine-profiles Generate SAFE + PERFORMANCE Sunshine profiles and manifest
+  setup [--system] Create default config/profiles; --system configures getty/tmux/sudoers
+  config-snapshot Show plasmactl + Sunshine configs/apps
+  config-template Write optional JSON overlay config template
+  sanity          Full post-boot runtime sanity check
+  gpu-assert      Verify selected GPU role/driver/render alignment
+  confirm-gpu     Confirm selected GPU isolation: confirm-gpu [igpu|dgpu|auto]
+  confirm-igpu    Alias for confirm-gpu igpu
+  confirm-dgpu    Alias for confirm-gpu dgpu
 
 GPU selection flags:
-  --gpu=igpu | --igpu    One-shot force integrated GPU role for start/restart/sanity
-  --gpu=dgpu | --dgpu    One-shot force discrete GPU role for start/restart/sanity
+  --gpu=igpu | --igpu    One-shot force integrated GPU role
+  --gpu=dgpu | --dgpu    One-shot force discrete GPU role
   --gpu=auto             One-shot auto selection
 
 Config: ${CONFIG_FILE}
-Example for current host:
-  plasmactl setup
-  # Optional for fresh install only:
-  plasmactl setup --system
 
 EOF_USAGE
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ARG PARSING + DISPATCH
+# ARG PARSING & DISPATCH
 # ─────────────────────────────────────────────────────────────────────────────
 
 POSITIONAL=()
