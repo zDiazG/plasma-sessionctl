@@ -1,5 +1,6 @@
-# Runtime / generated debug state
+# Runtime / generated state & logs
 .cache/
+.local/
 *.log
 *.pid
 *.lock
@@ -9,21 +10,43 @@
 *.old
 *.orig
 *.swp
+.*.kate-swp
+*.kate-swp
 *~
+.fuse_hidden*
 
-# Local release artifacts; prefer GitHub Releases later
+# Environment & Local Overrides
+.env
+.env.local
+*.override
+
+# Local release artifacts
 dist/
+build/
 *.tar.gz
 *.zip
+*.tar.xz
 
-# Sunshine/private runtime secrets - never commit
+# Sunshine / private credentials & runtime state
 **/credentials/
 **/sunshine_state.json
 **/cacert.pem
 **/cakey.pem
 *.pem
+*.key
+*.crt
 
-# Local editor/OS
+# Editor & OS artifacts
 .vscode/
 .idea/
 .DS_Store
+Thumbs.db
+.directory
+
+# Agent & temporary state
+*.AGENTS.md
+/AGENTS.md
+.agent-state/
+.agents/
+tmp/
+scratch/

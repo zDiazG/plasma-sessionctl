@@ -1,246 +1,243 @@
-# plasma-sessionctl / plasmactl v0.4.2
+# plasma-sessionctl (`plasmactl`)
 
-`plasmactl` is a Bash controller for a headless KDE Plasma Wayland session streamed through Sunshine/Moonlight on a multi-GPU Linux workstation.
+**Bash controller for isolated KDE Plasma Wayland sessions streamed via Sunshine, with multi-GPU (iGPU/dGPU) selection and systemd cgroup isolation.**
 
-This release is built for the validated `WhiteDwarf` topology:
+*README v0.4.3.1*
 
-- iGPU: Intel UHD 630, driver `i915`, preferred/default session GPU.
-- dGPU: AMD RX 5500 XT, driver `amdgpu`, may keep a dummy plug connected for compute/LLM availability.
-- Session: `getty@tty2` autologin -> `tmux` session `plasma` -> `startplasma-wayland`.
-- Streaming: Sunshine launched by transient `systemd-run`, not inside tmux, with only the selected GPU allowed.
+![Shell](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-Linux-informational)
+![Desktop](https://img.shields.io/badge/desktop-KDE%20Plasma%20Wayland-blue)
+![Streaming](https://img.shields.io/badge/streaming-Sunshine-orange)
+![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 
-## What v0.4.2 fixes
+`plasmactl` (from `plasma-sessionctl`) is a Bash controller that manages isolated, headless, or remote-desktop KDE Plasma Wayland sessions streamed through [Sunshine](https://github.com/LizardByte/Sunshine) and Moonlight.
 
-v0.4.x moved Sunshine from tmux to `systemd-run` because Sunshine KMS capture could select the dGPU when both iGPU and dGPU had connected outputs. The successful design is:
+It handles TTY allocation, session lifecycle inside `tmux`, hardware-level GPU selection (`--igpu` vs `--dgpu`), systemd device-cgroup isolation via `systemd-run`, headless EDID injection, dynamic Sunshine configuration profile generation, and empirical isolation verification.
 
-- Plasma/KWin still starts inside the real `tty2`/tmux session.
-- Sunshine starts as a transient system unit.
-- `DevicePolicy=closed` blocks all devices by default.
-- `DeviceAllow=/dev/dri/cardX` and `DeviceAllow=/dev/dri/renderDY` expose only the selected GPU to Sunshine.
-- `adapter_name` and `output_name` are intentionally unset. Sunshine auto-selects within the restricted device view.
-- `confirm-gpu` commands provide tagged runtime proof for iGPU/dGPU.
+---
 
-v0.4.2 also fixes a stray `warn` call from v0.4.1 and rejects the common typo `-dgpu`/`-igpu`; use `--dgpu`/`--igpu`.
+## Table of Contents
 
-## File layout
+- [About](#about)
+- [Requirements](#requirements)
+- [Installation & Sudoers](#installation--sudoers)
+- [Usage & Commands](#usage--commands)
+- [Configuration (`plasmactl.conf`)](#configuration-plasmactlconf)
 
-```text
-plasmactl                                      Main executable
-README.md                                      This document
-config/plasmactl.conf.example                  Shell runtime config
-config/plasmactl/config.json                   Optional JSON overlay config
-config/plasmactl/profiles.json                 Profile manifest
-config/sudoers.d/plasmactl                     Example sudoers rule
-sunshine/plasmactl-performance.conf            Sunshine performance profile
-sunshine/plasmactl-apps-performance.json       Sunshine apps for performance profile
-sunshine/plasmactl-safe.conf                   Sunshine safe fallback profile
-sunshine/plasmactl-apps-safe.json              Sunshine apps for safe profile
-docs/README-v0.4.2.md                          Copy of this README
-```
+---
 
-## Install / update
+## About
 
-```bash
-cd ~/Projects/repos/plasma-sessionctl
-cp ~/bin/plasmactl ~/bin/plasmactl.pre-v0.4.2.$(date +%Y%m%d-%H%M%S)
-install -m 755 ./plasmactl ~/bin/plasmactl
+Running a remote streaming desktop with KDE Plasma Wayland and Sunshine on multi-GPU setups (e.g. Intel iGPU + AMD/Nvidia dGPU) or headless nodes introduces a few recurring issues:
 
-mkdir -p ~/.config/plasmactl ~/.config/sunshine
-cp ./config/plasmactl.conf.example ~/.config/plasmactl.conf
-cp ./config/plasmactl/config.json ~/.config/plasmactl/config.json
-cp ./config/plasmactl/profiles.json ~/.config/plasmactl/profiles.json
-cp ./sunshine/plasmactl-performance.conf ~/.config/sunshine/
-cp ./sunshine/plasmactl-apps-performance.json ~/.config/sunshine/
-cp ./sunshine/plasmactl-safe.conf ~/.config/sunshine/
-cp ./sunshine/plasmactl-apps-safe.json ~/.config/sunshine/
-```
+1. **GPU Binding & Interference**: KWin or Sunshine may bind to the discrete GPU during idle desktop streaming, wasting power or locking device nodes needed by passthrough/secondary tasks.
+2. **Headless Display Output**: Plasma Wayland requires an active KMS connector/EDID to spawn display outputs.
+3. **Session Lifecycle & Clean Termination**: Starting Plasma manually inside a headless session can leave orphaned processes (`kwin_wayland`, `sunshine`, `systemd-run` transient units) if interrupted.
+4. **Privilege & Multi-User Safety**: Session commands must run strictly scoped under the target user (`REAL_USER`), preventing cross-user session termination on shared hosts.
 
-Recommended sudoers rule:
+`plasmactl` orchestrates the entire session lifecycle to address these.
 
-```bash
-sudo install -m 440 ./config/sudoers.d/plasmactl /etc/sudoers.d/plasmactl
-sudo visudo -cf /etc/sudoers.d/plasmactl
-```
+### What it actually does
 
-## Command reference
+- **GPU role isolation**: switches between `--igpu` and `--dgpu` on the fly; enforces device restrictions at the kernel DRM level (`KWIN_DRM_DEVICES`) and at the systemd cgroup level (`DeviceAllow`).
+- **Systemd-run isolation**: runs Sunshine as a transient systemd scope with restricted `/dev/dri/cardX` and `/dev/dri/renderDX` access, preventing it from touching unassigned GPUs.
+- **Headless EDID**: supports kernel/DRM connector forced EDID injection (`HEADLESS_MODE=kernel-forced-edid`), removing the need for physical HDMI dummy plugs.
+- **Dynamic Sunshine profiles**: generates `safe` and `performance` configurations at startup with tuned encoder settings (VAAPI, bitrate, QP, FEC).
+- **Process scoping**: all `pkill`/`pgrep` calls are bound to `REAL_USER` (`-u "$REAL_USER"`), ensuring multi-user safety.
+- **Syslog reporting**: runtime failures emit structured alerts to `logger` / systemd journal (`plasma-sessionctl`).
+- **Empirical verification**: `confirm-gpu` checks active isolation via `/proc/$PID/fd` file descriptors and systemd journal logs.
 
-### Start default iGPU session
+---
 
-```bash
-plasmactl --igpu start --verbose
-```
+## Requirements
 
-Equivalent when `PLASMA_GPU_DEFAULT=igpu`:
+- **OS**: Linux (kernel 5.15+) with `systemd`, `loginctl`, and `chvt`.
+- **Desktop**: KDE Plasma Wayland (`startplasma-wayland`, `kwin_wayland`).
+- **Streamer**: Sunshine (`sunshine`).
+- **Session Manager**: `tmux`.
+- **Privileges**: sudoers snippet for `chvt` and `systemd-run` (see [Installation & Sudoers](#installation--sudoers)).
+- **Optional**: `jq` (for JSON configuration overlays in `~/.config/plasmactl/config.json`).
 
-```bash
-plasmactl start --verbose
-```
+---
 
-### Start dGPU session override
+## Installation & Sudoers
 
-```bash
-plasmactl --dgpu start --verbose
-# or
-plasmactl --gpu=dgpu start --verbose
-```
+1. **Clone the repository**:
+   ```bash
+   git clone https://github.com/your-user/plasma-sessionctl.git
+   cd plasma-sessionctl
+   ```
 
-Do not use `-dgpu`. v0.4.2 rejects that typo.
+2. **Make `plasmactl` executable and move to PATH**:
+   ```bash
+   chmod +x plasmactl
+   sudo cp plasmactl /usr/local/bin/
+   ```
 
-### Stop session
+3. **Install sudoers permissions**:
+   `plasmactl` requires limited sudo privileges for virtual terminal switching (`chvt`) and launching transient systemd units (`systemd-run`).
 
-```bash
-plasmactl stop
-```
+   ```bash
+   # Copy sudoers template and edit <USERNAME> to match your Linux user
+   sudo cp config/sudoers.d/plasmactl /etc/sudoers.d/plasmactl
+   sudo sed -i "s/<USERNAME>/$USER/g" /etc/sudoers.d/plasmactl
+   sudo chmod 0440 /etc/sudoers.d/plasmactl
+   sudo visudo -cf /etc/sudoers.d/plasmactl
+   ```
 
-### Status and diagnostics
+4. **Initialize user configurations & Sunshine profiles**:
+   ```bash
+   # Automated setup via plasmactl
+   plasmactl setup --user
 
-```bash
-plasmactl status
-plasmactl sanity
-plasmactl detect-gpu
-plasmactl debug
-```
+   # Or manually copy templates:
+   mkdir -p ~/.config/plasmactl ~/.config/sunshine
+   cp config/plasmactl.conf.example ~/.config/plasmactl.conf
+   cp sunshine/* ~/.config/sunshine/
+   ```
 
-### Confirm selected GPU isolation
+---
 
-Use these after Moonlight has connected, or while Sunshine is online.
+## Usage & Commands
+
+### Subcommands
 
 ```bash
-plasmactl confirm-gpu igpu
-plasmactl confirm-gpu dgpu
+plasmactl start                 # Start default Plasma + Sunshine session (alias: up)
+plasmactl --igpu start          # Start session explicitly locked to iGPU
+plasmactl --dgpu start          # Start session explicitly locked to dGPU
+plasmactl stop                  # Stop current session & lock session state (alias: down)
+plasmactl restart               # Stop active session and start a new one
+plasmactl status                # Show active session, tmux, and GPU binding status
+plasmactl sanity                # Validate binaries, DRM nodes, TTYs, and permissions
+plasmactl sanity --fix          # Validate setup and attempt automatic correction
+plasmactl detect-gpu            # Auto-detect available iGPU and dGPU cards and drivers
+plasmactl confirm-gpu igpu      # Verify empirical GPU isolation for iGPU (or confirm-igpu)
+plasmactl confirm-gpu dgpu      # Verify empirical GPU isolation for dGPU (or confirm-dgpu)
+plasmactl setup --user          # Initialize user config directories and template files
+plasmactl setup --system        # Check system sudoers configuration
+plasmactl debug                 # Print detailed runtime environment diagnostics
+plasmactl version               # Display plasmactl script version info
+```
+
+### Flags
+
+- `--igpu` — Force session to run on the Integrated GPU (iGPU).
+- `--dgpu` — Force session to run on the Discrete GPU (dGPU).
+- `--gpu=<role>` — Select GPU role explicitly (`igpu` or `dgpu`).
+- `--verbose` — Enable verbose debug logging output during execution.
+- `--config=<path>` — Specify a custom configuration file path.
+- `--fix` — Auto-apply fixes where applicable (used with `sanity`).
+- `-h`, `--help` — Show CLI help reference.
+- `-v`, `--version` — Display version information.
+
+### Sunshine streaming profiles
+
+Pre-configured templates are located in the `sunshine/` directory:
+
+- `plasmactl-performance.conf` — High bitrate (20 Mbps), VAAPI hardware encoding, lower quantization parameter (`qp=14`), KMS capture.
+- `plasmactl-safe.conf` — Fallback profile using software encoding and conservative bitrate parameters for troubleshooting.
+- `plasmactl-apps-performance.json` / `plasmactl-apps-safe.json` — Application rules with standard launch shortcuts for **Desktop** and **Steam Big Picture** (`setsid steam -gamepadui`).
+
+### GPU isolation verification
+
+`plasmactl` does not rely on client-side reporting to verify GPU selection. The `confirm-gpu` command checks low-level kernel handles to verify true isolation:
+
+```bash
 plasmactl confirm-igpu
-plasmactl confirm-dgpu
 ```
 
-The confirmation output includes a stable tag:
-
+Sample output (verified iGPU isolation):
 ```text
 CONFIRM_TAG=confirm:igpu
 CONFIRM_RESULT=OK
-```
-
-or:
-
-```text
-CONFIRM_TAG=confirm:dgpu
-CONFIRM_RESULT=OK
-```
-
-For iGPU mode, the expected proof is:
-
-```text
 KWIN_DRM_DEVICES=/dev/dri/card1
 /dev/dri/card2: Operation not permitted
 /dev/dri/card1 -> i915
-Screencasting with KMS
 Creating encoder [h264_vaapi]
-vaapi vendor: Intel iHD driver
 Sunshine FDs: /dev/dri/card1 and /dev/dri/renderD128 only
 ```
 
-For dGPU mode, the expected proof is:
+- `KWIN_DRM_DEVICES` ensures KWin only sees the target card.
+- `Operation not permitted` confirms systemd device cgroups successfully block Sunshine from accessing unassigned GPUs.
+- File descriptors are inspected via `/proc/$PID/fd` of Sunshine to prove no open handles exist for non-target DRM nodes.
 
-```text
-KWIN_DRM_DEVICES=/dev/dri/card2
-/dev/dri/card1: Operation not permitted
-/dev/dri/card2 -> amdgpu
-vaapi vendor: Mesa Gallium ... AMD Radeon RX 5500 XT
-Sunshine FDs: /dev/dri/card2 and /dev/dri/renderD129 only
-```
+### Known caveats
 
-## Configuration spec
+- **Moonlight client logs** reflect client decoding hardware, not host encoding. Use `plasmactl confirm-gpu` on the host for authoritative proof.
+- **Idle GPU utilization**: tools like `nvtop` or `intel_gpu_top` may show negligible GPU activity when the desktop is completely static.
+- **Journal permissions**: if `confirm-gpu` reports inability to read systemd logs, ensure your user is in the `systemd-journal` group or that `/usr/bin/journalctl` is allowed in `/etc/sudoers.d/plasmactl`.
 
-### GPU role policy
+---
+
+## Configuration (`plasmactl.conf`)
+
+`plasmactl` reads settings from `~/.config/plasmactl.conf` (INI/bash syntax) and optionally merges JSON overlays from `~/.config/plasmactl/config.json`.
+
+### INI configuration
 
 ```bash
+# Session & TTY Defaults
+SESSION=plasma
+TTY_NAME=tty2
+ACTIVATE_TTY_ON_START=true
+REQUIRE_ACTIVE_TTY_ON_START=true
+
+# Stop Behavior & Locks
+LOCK_TMUX_ON_STOP=true
+KILL_TMUX_ON_STOP=false
+TERMINATE_TTY_SESSION_ON_STOP=false
+RETURN_TTY_ON_STOP=true
+RETURN_TTY_NAME=tty2
+
+# GPU Policy & Driver Filtering
 PLASMA_GPU_DEFAULT=igpu
 PLASMA_GPU_ALLOW_FALLBACK=false
 PLASMA_GPU_IGPU_DRIVERS="i915 xe"
 PLASMA_GPU_DGPU_DRIVERS="amdgpu nvidia nouveau"
-```
-
-`PLASMA_GPU_DEFAULT=igpu` keeps the stream session on the Intel iGPU. Use `--dgpu` for a one-shot dGPU override.
-
-### DRM selection
-
-```bash
 PLASMA_DRM_DEVICE=auto
 PLASMA_DRM_DRIVER_ORDER="i915 xe amdgpu"
-REQUIRE_CONNECTED_OUTPUT_ON_START=true
-ALLOW_VKMS=false
-```
 
-`auto` selects a real DRM card matching the requested GPU role. `REQUIRE_CONNECTED_OUTPUT_ON_START=true` prevents starting a KMS stream against a GPU with no active connector.
-
-### Headless EDID
-
-```bash
-HEADLESS_MODE=kernel-forced-edid
+# Headless & Display Output
+HEADLESS_MODE=none                    # none | kernel-forced-edid | vkms
 HEADLESS_FORCE_OUTPUT=HDMI-A-1
 HEADLESS_FORCE_MODE=1920x1080@60
-HEADLESS_EDID_FILE=white_1080p.bin
-```
+HEADLESS_EDID_FILE=edid_1080p.bin
+REQUIRE_CONNECTED_OUTPUT_ON_START=true
 
-The validated setup uses a forced EDID on the iGPU HDMI connector. BIOS must expose the iGPU even without a physical monitor.
-
-### Sunshine systemd-run isolation
-
-```bash
-SUNSHINE_START_MODE=systemd-run
-SUNSHINE_SYSTEMD_ISOLATE_DRI=true
-SUNSHINE_SYSTEMD_UNIT_PREFIX=sunshine-plasmactl
-SUNSHINE_SYSTEMD_REQUIRE_CAP_SYS_ADMIN=true
-SUNSHINE_SYSTEMD_DEVICE_ALLOW_UINPUT=true
-SUNSHINE_SYSTEMD_ASSERT_MODE=journal
-SUNSHINE_SYSTEMD_FD_ASSERT_STRICT=false
-```
-
-`journal` assertion mode checks Sunshine journal proof without killing a valid unit before the first Moonlight launch. FD checks remain diagnostic unless strict mode is explicitly enabled.
-
-### Sunshine adapter/output policy
-
-```bash
-SUNSHINE_ADAPTER_MODE=auto
-SUNSHINE_ADAPTER_NAME=
-SUNSHINE_OUTPUT_MODE=disabled
-SUNSHINE_OUTPUT_NAME=
-```
-
-Do not set `adapter_name` or `output_name` in systemd-run isolation mode. The selected GPU is enforced by `DeviceAllow`.
-
-### Performance profile
-
-```bash
-SUNSHINE_PERF_ENCODER=vaapi
-SUNSHINE_PERF_CAPTURE=kms
-SUNSHINE_PERF_MAX_BITRATE=20000
-SUNSHINE_PERF_QP=14
-SUNSHINE_PERF_FEC=5
-SUNSHINE_PERF_FPS_TARGET=60
-SUNSHINE_PERF_HEVC_MODE=1
-SUNSHINE_PERF_AV1_MODE=1
+# Sunshine Integration & Transient Unit Policy
+SUNSHINE_START_MODE=systemd-run       # systemd-run | tmux | systemd | auto
+SUNSHINE_PROFILE=performance          # performance | safe
 SUNSHINE_IGPU_LIBVA_DRIVER_NAME=iHD
+SUNSHINE_UDP_PORTS="47998 47999 48000 48002 48010"
+SUNSHINE_SYSTEMD_ISOLATE_DRI=true
+SUNSHINE_SYSTEMD_ASSERT_MODE=journal
 ```
 
-The iGPU baseline is H.264 VAAPI. HEVC/AV1 are disabled for stability on UHD 630-class hardware. Raise bitrate later only after the iGPU path remains stable.
+### JSON overlay (`config.json`)
 
-## Validation workflow
+If `jq` is available, `plasmactl` can load configuration options from `~/.config/plasmactl/config.json`:
 
-```bash
-plasmactl stop
-plasmactl --igpu start --verbose
-# connect Moonlight
-plasmactl confirm-igpu
-
-plasmactl stop
-plasmactl --dgpu start --verbose
-# connect Moonlight
-plasmactl confirm-dgpu
+```json
+{
+  "drm": {
+    "gpu_default": "igpu",
+    "gpu_allow_fallback": false,
+    "require_connected_output_on_start": true
+  },
+  "sunshine": {
+    "profile": "performance",
+    "start_mode": "systemd-run",
+    "systemd": {
+      "isolate_dri": true,
+      "assert_mode": "journal"
+    }
+  }
+}
 ```
 
-## Known caveats
+---
 
-- Moonlight client logs showing the client GPU are not proof that the workstation dGPU is being used. The authoritative proof is Sunshine journal + Sunshine/KWin `/proc/$pid/fd`.
-- `nvtop` may show very low usage on both GPUs while the desktop is idle. Use `confirm-gpu` for proof.
-- If `confirm-gpu` cannot read systemd journal, add `/usr/bin/journalctl` to the `plasmactl` sudoers rule.
-- A connected dummy on the dGPU is supported; Sunshine is blocked from it in iGPU mode by systemd device isolation.
+## License
+
+This project is licensed under the [GNU General Public License v3.0 or later](LICENSE).
