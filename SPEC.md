@@ -2,8 +2,10 @@
 
 Status: implemented development candidate. Plasma/managed Sunshine lifecycle,
 Intel VAAPI initialization, device enforcement and one startup rollback scenario
-have runtime evidence on one Intel setup. Moonlight video/audio/input acceptance
-remains pending. This file describes current behavior, including its
+have runtime evidence on one Intel setup. The maintainer reported working
+Moonlight video/audio/input over a wired LAN, with occasional menu/Settings
+opening flicker. Quantitative latency, loss and long-term reliability remain
+unmeasured. This file describes current behavior, including its
 limits; it does not certify deployment readiness.
 
 ## Supported boundary

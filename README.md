@@ -2,7 +2,7 @@
 
 Bash controller for KDE Plasma Wayland sessions and Sunshine streaming, with selectable GPU roles.
 
-Development candidate. The legacy backend remains the default; the managed Sunshine backend still requires runtime acceptance.
+Development candidate. The legacy backend remains the default. The managed backend has runtime evidence on one Intel setup; other deployments need their own acceptance checks.
 
 ![Shell](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Linux-informational)
@@ -153,8 +153,10 @@ is later changed; legacy start and cleanup cannot discard it.
 Plasma and managed Sunshine start/status/restart/stop have been exercised on one
 Intel/Plasma setup. A device-open probe confirmed that Sunshine's cgroup permits
 the selected Intel nodes and denies the other GPU. KWin reported Intel rendering
-and Sunshine initialized its Intel VAAPI H.264 encoder. Moonlight video, audio
-and input acceptance remain pending.
+and Sunshine initialized its Intel VAAPI H.264 encoder. The maintainer reported
+working Moonlight video, audio and input over a wired LAN, with improved perceived
+stability and occasional flicker when opening Plasma menus or Settings. This is
+one observed workflow, not a measured performance or long-term reliability claim.
 On KWin 6.8.1, the render selector also prevented KWin from retaining the other
 GPU's render node. Older KWin releases may ignore that selector and need their
 own descriptor checks.
