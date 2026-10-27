@@ -43,7 +43,7 @@ Running a remote streaming desktop with KDE Plasma Wayland and Sunshine on multi
 
 ### Current behavior
 
-- GPU selection passes `KWIN_DRM_DEVICES` to Plasma. This is a compositor selection setting, not a process-wide device access boundary.
+- Scope GPU selection passes `KWIN_DRM_DEVICES` and the matching `KWIN_RENDER_NODES` to Plasma. This selects the compositor's display and render devices; it does not restrict every process's device access. Legacy launch sets only the display selector.
 - The managed Sunshine candidate uses a fixed system service under the desktop UID with a DRM device allowlist. The restriction covers that service and its children.
 - The scope backend records launcher/native-unit identities and stops the recorded Sunshine before desktop teardown. The default legacy backend retains UID-wide process cleanup.
 - Scope starts preserve existing Sunshine profiles and application lists. Explicit profile-generation commands can replace those assets.
@@ -155,6 +155,9 @@ Intel/Plasma setup. A device-open probe confirmed that Sunshine's cgroup permits
 the selected Intel nodes and denies the other GPU. KWin reported Intel rendering
 and Sunshine initialized its Intel VAAPI H.264 encoder. Moonlight video, audio
 and input acceptance remain pending.
+On KWin 6.8.1, the render selector also prevented KWin from retaining the other
+GPU's render node. Older KWin releases may ignore that selector and need their
+own descriptor checks.
 Start checks the owned shell's Wayland socket before completing. Sunshine
 readiness requires the recorded service invocation and TCP listeners held by its
 main process. These checks do not prove video capture, encoding or Moonlight input.

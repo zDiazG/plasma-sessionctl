@@ -102,6 +102,12 @@ Do not mix controller generations or delete a lock while a controller is active.
 
 ## Privileged Sunshine interface
 
+Scope launch sets both `KWIN_DRM_DEVICES` and the selected GPU's canonical
+`KWIN_RENDER_NODES`. The latter limits render-device discovery on the observed
+KWin 6.8.1 release. It is included in tracked environment restoration. These
+compositor settings do not grant a device-access guarantee for arbitrary desktop
+applications or KWin versions that ignore the render selector.
+
 The installed `/usr/local/libexec/plasmactl-sunshine` derives the desktop UID
 from sudo and accepts only:
 
