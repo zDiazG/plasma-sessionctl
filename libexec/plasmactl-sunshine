@@ -1,0 +1,262 @@
+#!/usr/bin/python3 -I
+"""Restricted sudo interface for installed Sunshine units. No shell execution."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import subprocess
+import sys
+
+POLICY = Path('/etc/plasmactl/sunshine.json')
+RUNTIME = Path('/run/plasmactl')
+RUN_RE = re.compile(r'[a-f0-9]{32}')
+PCI_RE = re.compile(r'[a-f0-9]{4}:[a-f0-9]{2}:[a-f0-9]{2}\.[0-7]')
+ROLES = ('igpu', 'dgpu')
+PROFILES = {'normal': 'sunshine.conf', 'safe': 'plasmactl-safe.conf',
+            'performance': 'plasmactl-performance.conf'}
+ENV = {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C'}
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def trusted(path):
+    """Reject symlinks and non-root-writable policy/runtime paths."""
+    path = Path(path)
+    for component in (path, *path.parents):
+        info = component.lstat()
+        require(not stat.S_ISLNK(info.st_mode) and info.st_uid == 0
+                and not info.st_mode & 0o022, f'Untrusted path: {component}')
+
+
+def command(argv, check=True):
+    result = subprocess.run(argv, env=ENV, text=True, capture_output=True, timeout=35)
+    if check and result.returncode:
+        raise RuntimeError(result.stderr.strip() or f'{argv[0]} failed')
+    return result
+
+
+def properties(argv):
+    result = command(argv, check=False)
+    values = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+    require(result.returncode == 0 or values.get('LoadState') == 'not-found',
+            result.stderr.strip() or 'Manager query failed')
+    return values
+
+
+def unit_name(uid, role, run):
+    return f'plasmactl-sunshine-u{uid}-{role}@{run}.service'
+
+
+def unit_properties(unit):
+    return properties(['/usr/bin/systemctl', 'show', '-p', 'LoadState', '-p', 'ActiveState',
+                       '-p', 'InvocationID', '-p', 'User', '-p', 'MainPID',
+                       '-p', 'DevicePolicy', '-p', 'DeviceAllow', '-p', 'FragmentPath',
+                       '-p', 'DropInPaths', '--', unit])
+
+
+def validate_unit(uid, policy, role, live):
+    require(live.get('LoadState') == 'loaded' and live.get('User') == str(uid),
+            'Managed unit template is missing or has the wrong user')
+    expected_path = Path(f'/etc/systemd/system/plasmactl-sunshine-u{uid}-{role}@.service')
+    require(live.get('FragmentPath') == str(expected_path) and not live.get('DropInPaths'),
+            'Unexpected Sunshine definition or drop-in')
+    trusted(expected_path)
+    pci = policy['gpus'][role]
+    expected = {f'/dev/dri/by-path/pci-{pci}-card',
+                f'/dev/dri/by-path/pci-{pci}-render', '/dev/uinput'}
+    allow = live.get('DeviceAllow', '').split()
+    require(len(allow) == 6 and set(allow[::2]) == expected
+            and all(mode == 'rw' for mode in allow[1::2])
+            and live.get('DevicePolicy') == 'closed', 'Installed device policy does not match')
+
+
+def listening_ports(pid):
+    """Only sockets held by the unit's current main process count as readiness."""
+    sockets = set()
+    for entry in Path(f'/proc/{pid}/fd').iterdir():
+        try:
+            target = os.readlink(entry)
+        except FileNotFoundError:
+            continue
+        match = re.fullmatch(r'socket:\[([0-9]+)\]', target)
+        if match:
+            sockets.add(match[1])
+    ports = set()
+    for family in ('tcp', 'tcp6'):
+        path = Path(f'/proc/{pid}/net/{family}')
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines()[1:]:
+            fields = line.split()
+            if fields[3] == '0A' and fields[9] in sockets:
+                ports.add(int(fields[1].rsplit(':', 1)[1], 16))
+    return sorted(ports)
+
+
+def load_policy(uid):
+    trusted(POLICY)
+    with POLICY.open() as stream:
+        policy = json.load(stream)
+    require(policy.get('schema') == 1, 'Unsupported policy schema')
+    entry = policy.get('users', {}).get(str(uid))
+    require(isinstance(entry, dict), 'Caller is not enabled in the installed policy')
+    require(re.fullmatch(r'tty[1-9][0-9]*', entry.get('tty', '')), 'Invalid policy TTY')
+    require(isinstance(entry.get('gpus'), dict) and entry['gpus'], 'Missing policy GPUs')
+    for role, pci in entry['gpus'].items():
+        require(role in ROLES and isinstance(pci, str) and PCI_RE.fullmatch(pci),
+                'Invalid GPU policy')
+    return entry
+
+
+def devices(policy, role):
+    pci = policy['gpus'].get(role)
+    require(pci is not None, 'GPU role is not enabled')
+    card = Path(f'/dev/dri/by-path/pci-{pci}-card')
+    render = Path(f'/dev/dri/by-path/pci-{pci}-render')
+    for path in (card, render):
+        require(path.exists() and stat.S_ISCHR(path.stat().st_mode), 'Configured DRM node unavailable')
+    require(card.resolve().parent == Path('/dev/dri') and
+            render.resolve().parent == Path('/dev/dri'), 'Unexpected DRM device path')
+    return str(card.resolve()), str(render.resolve())
+
+
+def validate_args(args):
+    require(len(args) >= 3, 'Expected ACTION RUN ROLE [arguments]')
+    action, run, role, *extra = args
+    require(action in ('check', 'start', 'stop', 'status'), 'Invalid action')
+    require(RUN_RE.fullmatch(run) is not None and role in ROLES, 'Invalid run or GPU role')
+    require(len(extra) == {'check': 0, 'status': 0, 'stop': 1, 'start': 3}[action],
+            'Unexpected arguments')
+    if action == 'stop':
+        require(RUN_RE.fullmatch(extra[0]) is not None, 'Invalid invocation')
+    if action == 'start':
+        sid, display, profile = extra
+        require(re.fullmatch(r'[a-zA-Z0-9_-]+', sid) is not None, 'Invalid login ID')
+        require(re.fullmatch(r'wayland-[0-9]+', display) is not None, 'Invalid Wayland display')
+        require(profile in PROFILES, 'Invalid Sunshine profile')
+    return action, run, role, extra
+
+
+def env_text(values):
+    result = []
+    for key, value in values.items():
+        require(not any(c in value for c in '\n\r\0'), 'Invalid environment value')
+        result.append(key + '="' + value.replace('\\', '\\\\').replace('"', '\\"') + '"\n')
+    return ''.join(result)
+
+
+def validate_config(config, home, uid):
+    # A privileged-capability process must not consume configuration replaceable
+    # by another account. Restrict the fixed path and its user-owned directories.
+    for path in (home, home / '.config', home / '.config/sunshine', config):
+        info = path.lstat()
+        require(not stat.S_ISLNK(info.st_mode) and info.st_uid == uid
+                and not info.st_mode & 0o022, f'Unsafe Sunshine config path: {path}')
+        require(stat.S_ISREG(info.st_mode) if path == config else stat.S_ISDIR(info.st_mode),
+                f'Unexpected Sunshine config path type: {path}')
+
+
+def session_environment(uid, account, policy, run, role, extra):
+    sid, display, profile = extra
+    login = properties(['/usr/bin/loginctl', 'show-session', '-p', 'User', '-p', 'Seat',
+                        '-p', 'TTY', '-p', 'Active', '--', sid])
+    require(login.get('User') == str(uid) and login.get('Seat') == 'seat0'
+            and login.get('TTY') == policy['tty'] and login.get('Active') == 'yes',
+            'Login does not match the active permitted UID/seat/TTY')
+    runtime = Path(f'/run/user/{uid}')
+    socket = runtime / display
+    info = socket.stat()
+    require(stat.S_ISSOCK(info.st_mode) and info.st_uid == uid and not socket.is_symlink(),
+            'Wayland socket does not belong to the caller')
+    config = Path(account.pw_dir) / '.config/sunshine' / PROFILES[profile]
+    validate_config(config, Path(account.pw_dir), uid)
+    card, render = devices(policy, role)
+    values = {'HOME': account.pw_dir, 'XDG_RUNTIME_DIR': str(runtime),
+              'WAYLAND_DISPLAY': display, 'XDG_SESSION_ID': sid,
+              'XDG_SESSION_TYPE': 'wayland', 'XDG_CURRENT_DESKTOP': 'KDE',
+              'DBUS_SESSION_BUS_ADDRESS': f'unix:path={runtime}/bus',
+              'KWIN_DRM_DEVICES': card, 'PLASMACTL_RUN_ID': run,
+              'PLASMACTL_SUNSHINE_CONFIG': str(config)}
+    return values, card, render
+
+
+def operate(uid, account, policy, action, run, role, extra):
+    unit = unit_name(uid, role, run)
+    record = RUNTIME / f'{uid}-{role}-{run}.env'
+    live = unit_properties(unit)
+    if record.exists() or record.is_symlink():
+        trusted(record)
+    active = live.get('ActiveState', 'inactive') not in ('inactive', 'failed')
+    if action in ('check', 'start'):
+        validate_unit(uid, policy, role, live)
+    if action == 'check':
+        card, render = devices(policy, role)
+        return {'unit': unit, 'card': card, 'render': render}
+    if action == 'start':
+        require(not active and not record.exists(), 'Run already exists; refusing adoption')
+        values, _, _ = session_environment(uid, account, policy, run, role, extra)
+        # A root-owned run record is created before activation. Failed starts retain
+        # it so a later controller can inspect and stop this exact run.
+        with record.open('x') as stream:
+            os.chmod(record, 0o600)
+            stream.write(env_text(values))
+        command(['/usr/bin/systemctl', 'start', '--', unit])
+        live = unit_properties(unit)
+        require(live.get('ActiveState') == 'active', 'Sunshine unit did not become active')
+    elif action == 'stop':
+        require(record.is_file(), 'No privileged run record; refusing stop')
+        trusted(record)
+        if active:
+            require(live.get('InvocationID') == extra[0] and live.get('User') == str(uid),
+                    'Sunshine invocation or user changed; refusing stop')
+            command(['/usr/bin/systemctl', 'stop', '--', unit])
+            live = unit_properties(unit)
+            require(live.get('ActiveState') in ('inactive', 'failed'), 'Sunshine did not stop')
+        record.unlink()
+    if live.get('ActiveState', 'inactive') not in ('inactive', 'failed'):
+        require(record.is_file() and live.get('User') == str(uid), 'Unowned Sunshine unit')
+    ports = []
+    if live.get('ActiveState') == 'active' and live.get('MainPID', '0').isdigit() and int(live['MainPID']) > 0:
+        ports = listening_ports(live['MainPID'])
+        # Do not pair socket evidence from one incarnation with a newer one.
+        current = unit_properties(unit)
+        require(current.get('InvocationID') == live.get('InvocationID') and
+                current.get('MainPID') == live.get('MainPID'), 'Sunshine changed during inspection')
+    return {'unit': unit, 'state': live.get('ActiveState', 'inactive'),
+            'invocation': live.get('InvocationID', ''), 'pid': live.get('MainPID', '0'),
+            'recorded': record.is_file(), 'listeners': ports}
+
+
+def main(args):
+    action, run, role, extra = validate_args(args)
+    require(os.geteuid() == 0, 'This helper requires sudo')
+    uid_text = os.environ.get('SUDO_UID', '')
+    require(re.fullmatch(r'[1-9][0-9]*', uid_text) is not None, 'A non-root sudo caller is required')
+    uid = int(uid_text)
+    account = pwd.getpwuid(uid)
+    os.umask(0o077)
+    RUNTIME.mkdir(mode=0o700, exist_ok=True)
+    trusted(RUNTIME)
+    integration_lock = Path('/run/plasmactl-integration.lock')
+    if integration_lock.exists() or integration_lock.is_symlink():
+        trusted(integration_lock)
+    with integration_lock.open('a') as installation, (RUNTIME / f'{uid}.lock').open('a') as lock:
+        fcntl.flock(installation, fcntl.LOCK_SH)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        policy = load_policy(uid)
+        require(role in policy['gpus'], 'GPU role is not enabled')
+        print(json.dumps(operate(uid, account, policy, action, run, role, extra)))
+
+
+if __name__ == '__main__':
+    try:
+        main(sys.argv[1:])
+    except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+        print(f'plasmactl-sunshine: {error}', file=sys.stderr)
+        sys.exit(1)

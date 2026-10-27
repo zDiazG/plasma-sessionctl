@@ -1,0 +1,24 @@
+[Unit]
+Description=Managed Sunshine for UID @UID@ on @ROLE@, run %i
+
+[Service]
+Type=exec
+User=@UID@
+Group=@GID@
+WorkingDirectory=@WORKDIR@
+EnvironmentFile=/run/plasmactl/@UID@-@ROLE@-%i.env
+ExecStart=/usr/bin/sunshine ${PLASMACTL_SUNSHINE_CONFIG}
+Restart=no
+KillMode=control-group
+TimeoutStartSec=20
+TimeoutStopSec=15
+DevicePolicy=closed
+DeviceAllow=/dev/dri/by-path/pci-@PCI@-card rw
+DeviceAllow=/dev/dri/by-path/pci-@PCI@-render rw
+DeviceAllow=/dev/uinput rw
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_NICE
+NoNewPrivileges=no
+UMask=0077
+
+# This service has no Install section. Only the restricted helper starts it.
+# No ambient capabilities are granted to application commands.
