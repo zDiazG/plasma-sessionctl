@@ -150,8 +150,11 @@ while the recorded scope and both core process identities still match. An existi
 record routes stop/status through this backend even if the default configuration
 is later changed; legacy start and cleanup cannot discard it.
 
-The Plasma-only lifecycle has been exercised on one Intel/Plasma setup. The
-managed Sunshine integration still requires host activation and runtime evidence.
+Plasma and managed Sunshine start/status/restart/stop have been exercised on one
+Intel/Plasma setup. A device-open probe confirmed that Sunshine's cgroup permits
+the selected Intel nodes and denies the other GPU. KWin reported Intel rendering
+and Sunshine initialized its Intel VAAPI H.264 encoder. Moonlight video, audio
+and input acceptance remain pending.
 Start checks the owned shell's Wayland socket before completing. Sunshine
 readiness requires the recorded service invocation and TCP listeners held by its
 main process. These checks do not prove video capture, encoding or Moonlight input.
@@ -161,8 +164,8 @@ before desktop activation. Other custom desktop autostarts still require review.
 Stop does not apply legacy console lock, TTY return or login/session termination
 policies. Failed startup attempts rollback only for the execution created by that
 attempt. Identity mismatches and unresolved partial states retain the record for
-review. Rollback has isolated fixture coverage; host fault-injection acceptance
-is still pending. Automatic native service restarts can change invocation IDs
+review. A rejected Sunshine configuration has exercised startup rollback on that
+host; this does not cover every failure mode. Automatic native service restarts can change invocation IDs
 and require review. Plasma can change other user-manager environment
 values beyond the tracked session variables. These limits remain open work.
 

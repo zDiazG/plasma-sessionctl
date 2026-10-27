@@ -1,8 +1,9 @@
 # Session lifecycle contract
 
-Status: implemented development candidate. Plasma-only runtime evidence exists
-for one Intel setup. Managed Sunshine capture, device enforcement and streaming
-acceptance remain pending. This file describes current behavior, including its
+Status: implemented development candidate. Plasma/managed Sunshine lifecycle,
+Intel VAAPI initialization, device enforcement and one startup rollback scenario
+have runtime evidence on one Intel setup. Moonlight video/audio/input acceptance
+remains pending. This file describes current behavior, including its
 limits; it does not certify deployment readiness.
 
 ## Supported boundary
