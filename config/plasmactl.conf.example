@@ -30,8 +30,12 @@ TERMINATE_TTY_SESSION_ON_STOP=false
 RETURN_TTY_ON_STOP=true
 RETURN_TTY_NAME=tty2
 
-# Sunshine session startup mode:
-# - systemd-run: Transient root unit with DeviceAllow cgroup isolation (Recommended)
+# Session lifecycle backend. The managed candidate requires separate installation.
+# See SPEC.md and docs/INSTALLATION.md before selecting systemd-scope.
+PLASMA_SESSION_BACKEND=legacy
+
+# Legacy Sunshine startup modes. These do not use the restricted managed helper.
+# - systemd-run: Transient root unit using the legacy privilege configuration
 # - tmux: Foreground window inside target tmux session
 # - systemd: Standard user systemd service
 SUNSHINE_START_MODE=systemd-run
