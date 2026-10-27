@@ -25,6 +25,22 @@ VERBOSE=false
 FIX_MODE=false
 PLASMA_ONLY=false
 
+# Bootstrap must work before dependencies or valid user configuration exist.
+# Dispatch before sourcing config, creating directories or resolving user tools.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == bootstrap ]]; then
+    shift
+    bootstrap_root="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
+    [[ -f "${bootstrap_root}/tools/bootstrap.py" ]] || {
+        echo 'Bootstrap resources are missing. Run install.sh from a complete checkout.' >&2
+        exit 1
+    }
+    command -v python3 >/dev/null 2>&1 || {
+        echo 'Bootstrap requires Python 3.10+; install it through your distribution package manager.' >&2
+        exit 1
+    }
+    exec python3 -I "${bootstrap_root}/tools/bootstrap.py" "$@"
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 # USER CONTEXT & PRIVILEGE WRAPPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3522,6 +3538,7 @@ Flags:
   --plasma-only  Start/restart experimental scope backend without Sunshine
 
 Commands:
+  bootstrap       plan|install|configure|integration; run bootstrap --help for options
   start           Launch Plasma + Sunshine on selected real DRM target
   stop            Stop Sunshine/Plasma and lock physical tmux console
   restart         stop + start
