@@ -66,57 +66,62 @@ Running a remote streaming desktop with KDE Plasma Wayland and Sunshine on multi
 
 ## Installation & Sudoers
 
-Start from a checkout and inspect the supported commands:
+Start from a complete checkout. Bash, coreutils and Python 3.10+ are the
+bootstrap prerequisites:
 
 ```bash
 git clone https://github.com/zDiazG/plasma-sessionctl.git
 cd plasma-sessionctl
-chmod +x plasmactl
-./plasmactl --help
+./install.sh plan
+./install.sh install --dry-run --install-deps
+# Apply only after reviewing the plan:
+./install.sh install --install-deps
 ```
 
-Follow [the installation guide](docs/INSTALLATION.md). It separates bundle
-preparation, validation, inactive installation, user configuration and activation.
-The old unrestricted sudoers example and `setup --system` installer are retired.
-Getty/PAM, tmux console setup, autologin and boot changes remain separate host
-operations.
+`install.sh` is a Bash launcher for the same bootstrap exposed through
+`./plasmactl bootstrap`. Dependency installation supports Arch/CachyOS with
+`pacman` and existing configured repositories. An unavailable Sunshine package
+stops installation; the bootstrap does not add repositories, invoke AUR helpers,
+refresh databases alone or perform an implicit system upgrade. Other systems
+need manual dependency preparation and explicit `--skip-dependencies`.
 
-### What installation currently covers
+### CLI and setup responsibilities
 
-The central CLI is the Bash script `plasmactl`. It provides lifecycle commands,
-`status`, `doctor`, `session-check`, `sanity` and configuration/profile generation.
-It can be installed as an executable on your PATH; the managed Sunshine helper
-has its own fixed privileged installation path.
+The central lifecycle CLI remains Bash. Python standard-library tools handle
+structured discovery, per-user installation and privileged integration. Default
+`plan` and explicit `--dry-run` do not source user configuration, create files,
+install packages or activate services.
 
-To install only the user CLI from this checkout:
-
-```bash
-install -Dm755 plasmactl "$HOME/.local/bin/plasmactl"
-```
-
-Ensure `~/.local/bin` is on your PATH. This copies the controller; it does not
-install its dependencies or privileged integration.
-
-There is no `install.sh` or complete fresh-machine bootstrap yet. Install the
-requirements listed above through your distribution's supported packages first.
-Current setup tools assume Plasma, Sunshine, the existing seat0 login and tmux
-environment are already available:
-
-| Entry point | Current responsibility |
+| Entry point | Responsibility |
 | --- | --- |
-| `plasmactl setup --user` | Create a missing shell config and regenerate Sunshine profile/apps assets |
-| `tools/prepare-sunshine-integration.py` | Render the host-specific helper, policy, units and sudoers bundle |
-| `tools/install-sunshine-integration.py` | Install or restore reviewed integration files without activating services |
-| `plasmactl doctor` / `session-check` | Diagnose prerequisites and conflicts; do not install dependencies or repair the host |
-| `plasmactl status` | Inspect the selected backend; managed status checks owned units and Sunshine listeners |
+| `./install.sh plan` / `plasmactl bootstrap plan` | Report dependencies, available environment evidence and missing configuration |
+| `plasmactl bootstrap install` | Install a versioned user CLI and create absent config/profile/app assets |
+| `plasmactl bootstrap configure` | Create only absent user assets; preserve existing configuration and pairing |
+| `plasmactl bootstrap integration prepare` | Render the reviewed helper, policy, service and sudoers bundle |
+| `plasmactl bootstrap integration install` / `rollback` | Explicit privileged integration operations; never activate services |
+| `plasmactl doctor` / `session-check` / `status` | Existing prerequisite, conflict and runtime diagnostics |
 
-Sunshine installation, initial credentials/pairing and a complete dependency
-installer are not implemented by these commands. Some diagnostics still use
-legacy discovery; see [the diagnostic limits](#gpu-selection-and-evidence-limits).
+The default user prefix is `~/.local`; ensure `~/.local/bin` is on your PATH.
+The installed entry point links to a self-contained versioned tree, so bootstrap
+continues to work after the source checkout is moved. Existing CLI replacement
+requires `--replace-cli` and retains the previous entry point in a private receipt.
+`--no-configure` installs only the CLI. Keep receipts for recovery.
 
-`setup --user`, `sunshine-safe` and `sunshine-profiles` regenerate profile assets;
-back up customized profiles and application lists before using them. Preservation
-of existing assets applies to scope startup, not all generation commands.
+New bootstrap configuration selects the managed backend and iGPU with fallback
+disabled. Existing shell/JSON configuration, profiles, apps and credentials remain
+unchanged and may select different behavior. `--install-deps` is explicit;
+package transactions are handled by pacman and are not rolled back by the user
+CLI installer. No bootstrap command prepares a getty, logs in a user, activates
+Plasma, disables existing Sunshine autostart or initializes passwords/pairing.
+
+Follow [the installation guide](docs/INSTALLATION.md) for those reviewed setup
+steps and integration recovery. Some diagnostics still use legacy discovery;
+see [the diagnostic limits](#gpu-selection-and-evidence-limits).
+
+The older `setup --user`, `sunshine-safe` and `sunshine-profiles` commands still
+regenerate profile assets; back up customizations before using them. Prefer
+`bootstrap configure` for creation without replacement. Legacy `setup --system`
+is retired.
 
 ---
 
@@ -125,6 +130,8 @@ of existing assets applies to scope startup, not all generation commands.
 ### Subcommands
 
 ```bash
+plasmactl bootstrap plan        # Inspect installation needs without mutations
+plasmactl bootstrap configure   # Create absent configuration/assets only
 plasmactl start                 # Start using the configured backend and Sunshine setting
 plasmactl --igpu start          # Select the integrated GPU role
 plasmactl --dgpu start          # Select the discrete GPU role
