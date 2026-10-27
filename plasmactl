@@ -23,6 +23,7 @@ set -euo pipefail
 VERSION="0.4.3"
 VERBOSE=false
 FIX_MODE=false
+PLASMA_ONLY=false
 
 # ─────────────────────────────────────────────────────────────────────────────
 # USER CONTEXT & PRIVILEGE WRAPPERS
@@ -46,20 +47,20 @@ SUNSHINE_BIN="${SUNSHINE_BIN:-$(command -v sunshine 2>/dev/null || echo /usr/bin
 TMUX_BIN="${TMUX_BIN:-$(command -v tmux 2>/dev/null || echo /usr/bin/tmux)}"
 
 # Run user-space tools under REAL_USER context when script runs as root
-_run_as_user() {
+_run_as_user() (
+    # A tmux client or any long-lived child must not retain the lifecycle lock.
+    if [[ -n "${PLASMACTL_LOCK_FD:-}" ]]; then
+        exec {PLASMACTL_LOCK_FD}>&-
+    fi
     if [[ "${EUID}" -eq 0 ]]; then
         sudo -u "${REAL_USER}" "$@"
     else
         "$@"
     fi
-}
+)
 
 _sudo() {
-    if sudo -n true 2>/dev/null; then
-        sudo -n "$@"
-    else
-        return 1
-    fi
+    sudo -n "$@"
 }
 
 _priv() {
@@ -80,6 +81,7 @@ PLASMACTL_JSON_CONFIG="${PLASMACTL_JSON_CONFIG:-${CONFIG_DIR}/plasmactl/config.j
 PLASMACTL_USE_JSON_CONFIG="${PLASMACTL_USE_JSON_CONFIG:-auto}" # auto|true|false
 
 # Defaults. Can be overridden in ~/.config/plasmactl.conf or env.
+PLASMA_SESSION_BACKEND="${PLASMA_SESSION_BACKEND:-legacy}" # legacy | systemd-scope
 SESSION="${SESSION:-plasma}"
 TTY_NAME="${TTY_NAME:-tty2}"
 ACTIVATE_TTY_ON_START="${ACTIVATE_TTY_ON_START:-true}"
@@ -168,11 +170,16 @@ fi
 
 # Optional structured JSON overlay configuration support
 _apply_json_scalar() {
-    local var="$1" jqpath="$2" val
+    local var="$1" jqpath="$2" present val
     command -v jq >/dev/null 2>&1 || return 0
     [[ -f "${PLASMACTL_JSON_CONFIG}" ]] || return 0
-    val="$(jq -er "${jqpath} // empty" "${PLASMACTL_JSON_CONFIG}" 2>/dev/null || true)"
-    [[ -n "${val}" && "${val}" != "null" ]] || return 0
+    if ! present="$(jq -e "(${jqpath}) != null" "${PLASMACTL_JSON_CONFIG}" 2>/dev/null)" || [[ "${present}" != true ]]; then
+        return 0
+    fi
+    val="$(jq -r "(${jqpath}) | if type == \"array\" then join(\" \") elif type == \"object\" then error(\"expected a scalar or array\") else tostring end" "${PLASMACTL_JSON_CONFIG}")" || {
+        echo "[plasmactl] ERROR: Invalid JSON value for ${var} in ${PLASMACTL_JSON_CONFIG}" >&2
+        return 1
+    }
     printf -v "${var}" '%s' "${val}"
 }
 
@@ -185,6 +192,10 @@ fi
 
 if [[ "${PLASMACTL_USE_JSON_CONFIG}" != "false" && -f "${PLASMACTL_JSON_CONFIG}" ]]; then
     if command -v jq >/dev/null 2>&1; then
+        if ! jq -e 'type == "object"' "${PLASMACTL_JSON_CONFIG}" >/dev/null 2>&1; then
+            echo "[plasmactl] ERROR: JSON config must contain a valid object: ${PLASMACTL_JSON_CONFIG}" >&2
+            exit 1
+        fi
         _apply_json_scalar PLASMA_DRM_DEVICE '.drm.device'
         _apply_json_scalar PLASMA_DRM_DEVICE_AUTO_FALLBACK '.drm.auto_fallback'
         _apply_json_scalar PLASMA_DRM_DRIVER_ORDER '.drm.driver_order | if type=="array" then join(" ") else . end'
@@ -253,6 +264,7 @@ SUNSHINE_PID_FILE="${STATE_DIR}/sunshine.pid"
 SESSION_ID_FILE="${STATE_DIR}/session.id"
 TARGET_DEVICE_FILE="${STATE_DIR}/plasma.device"
 WAYLAND_DISPLAY_FILE="${STATE_DIR}/wayland.display"
+SCOPE_STATE_FILE="${STATE_DIR}/scope-session.json"
 LOCK_FILE="${STATE_DIR}/lock"
 START_LOG="${LOG_DIR}/start.log"
 STOP_LOG="${LOG_DIR}/stop.log"
@@ -347,26 +359,37 @@ check_required_bins() {
 }
 
 acquire_lock() {
-    local timeout=10 waited=0 holder=""
-    vlog "Acquiring lock..."
-    while ! (set -o noclobber; echo $$ > "${LOCK_FILE}") 2>/dev/null; do
-        holder="$(cat "${LOCK_FILE}" 2>/dev/null || echo unknown)"
-        if [[ "${holder}" =~ ^[0-9]+$ ]] && ! kill -0 "${holder}" 2>/dev/null; then
-            vlog "Removing stale lock from dead PID ${holder}"
-            rm -f "${LOCK_FILE}"
-            continue
+    local holder=""
+    command -v flock >/dev/null || { err "flock is required for lifecycle operations."; return 1; }
+    if [[ -f "${LOCK_FILE}" ]]; then
+        holder="$(cat "${LOCK_FILE}")" || return 1
+        if [[ "${holder}" =~ ^[0-9]+$ ]] && kill -0 "${holder}" 2>/dev/null; then
+            err "An older controller still holds the PID lock; wait for it to exit."
+            return 1
         fi
-        if [[ ${waited} -ge ${timeout} ]]; then
-            err "Lock held by PID ${holder} after ${timeout}s — run: plasmactl cleanup"
-            exit 1
-        fi
-        sleep 1; (( waited++ ))
-    done
-    trap release_lock EXIT INT TERM
-    vlog "Lock acquired (PID $$)"
+    fi
+    # Keep this inode in place. Unlinking a flock file permits a second lock
+    # on a replacement inode while the first process is still working.
+    exec {PLASMACTL_LOCK_FD}>>"${LOCK_FILE}" || return 1
+    if ! flock -w 10 "${PLASMACTL_LOCK_FD}"; then
+        exec {PLASMACTL_LOCK_FD}>&-
+        unset PLASMACTL_LOCK_FD
+        err "Timed out waiting for the lifecycle lock."
+        return 1
+    fi
+    : > "${LOCK_FILE}"
+    printf 'flock:%s\n' "$$" >&"${PLASMACTL_LOCK_FD}"
+    trap release_lock EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 }
 
-release_lock() { rm -f "${LOCK_FILE}"; }
+release_lock() {
+    [[ -n "${PLASMACTL_LOCK_FD:-}" ]] || return 0
+    flock -u "${PLASMACTL_LOCK_FD}"
+    exec {PLASMACTL_LOCK_FD}>&-
+    unset PLASMACTL_LOCK_FD
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGINCTL / TMUX MANAGEMENT
@@ -547,6 +570,29 @@ _card_has_connected_display() {
     return 1
 }
 
+_require_kms_output_ready() {
+    local card_name
+    _bool_true "${REQUIRE_CONNECTED_OUTPUT_ON_START}" || return 0
+
+    if [[ -z "${TARGET_DRM_DEVICE:-}" ]]; then
+        err "Cannot check KMS output: no DRM device is selected."
+        return 1
+    fi
+
+    card_name="$(basename "${TARGET_DRM_DEVICE}")"
+    if [[ ! "${card_name}" =~ ^card[0-9]+$ ]]; then
+        err "Cannot check KMS output for invalid DRM card '${TARGET_DRM_DEVICE}'."
+        return 1
+    fi
+
+    if ! _card_has_connected_display "${card_name}"; then
+        err "No connected KMS output is reported for ${TARGET_DRM_DEVICE}. Check the selected GPU, display cable or forced-EDID kernel settings."
+        return 1
+    fi
+
+    vlog "Connected KMS output found for ${TARGET_DRM_DEVICE}"
+}
+
 _card_connected_connectors() {
     local card_name="$1" connector status
     for connector in /sys/class/drm/${card_name}-*; do
@@ -569,6 +615,36 @@ _first_connected_connector() {
 _connector_short_name() {
     local name="$1"
     echo "${name}" | sed -E 's/^card[0-9]+-//'
+}
+
+_validate_headless_edid_inputs() {
+    local connector="$1" mode="$2" edid_file="$3"
+    if [[ ! "${connector}" =~ ^[[:alnum:]_.-]+$ ]]; then
+        err "Invalid DRM connector name '${connector}'."
+        return 2
+    fi
+    if [[ ! "${mode}" =~ ^[0-9]+x[0-9]+@[0-9]+$ ]]; then
+        err "Invalid forced display mode '${mode}'. Expected WIDTHxHEIGHT@REFRESH."
+        return 2
+    fi
+    if [[ ! "${edid_file}" =~ ^[[:alnum:]_.-]+$ || "${edid_file}" == *..* ]]; then
+        err "Invalid EDID filename '${edid_file}'. Use a plain filename without path components."
+        return 2
+    fi
+}
+
+_limine_cmdline_sed_expression() {
+    local params="$1"
+    local safe_params_re='^[[:alnum:]_.:@/=& -]+$'
+    local sed_params
+    if [[ ! "${params}" =~ ${safe_params_re} ]]; then
+        err "Refusing unsafe Limine kernel parameters."
+        return 2
+    fi
+    sed_params=${params//\\/\\\\}
+    sed_params=${sed_params//\&/\\\&}
+    sed_params=${sed_params//|/\\|}
+    printf '/^KERNEL_CMDLINE\\[default\\]/{s|"$| %s"|}' "${sed_params}"
 }
 
 _connector_sysfs_path() {
@@ -827,6 +903,81 @@ resolve_plasma_drm_device() {
     vlog "Auto-selected DRM device: ${TARGET_DRM_DEVICE}"
 }
 
+# Inspect prerequisites for a NEW systemd-managed execution. This does not
+# adopt an existing session or establish that DRM/streaming will work.
+_session_property() {
+    local properties="$1" key="$2"
+    awk -v key="${key}" 'index($0, key "=") == 1 {print substr($0, length(key) + 2); exit}' <<< "${properties}"
+}
+
+cmd_session_check() {
+    local sessions sid properties user type seat tty unit units state load
+    local conflict=false unavailable=false login_found=false
+    printf 'Systemd session preflight for a new execution\n'
+    if ! sessions="$("${LOGINCTL_BIN}" list-sessions --no-legend 2>/dev/null)"; then
+        err "Cannot query logind sessions."
+        return 2
+    fi
+    while read -r sid _; do
+        [[ -n "${sid}" ]] || continue
+        if ! properties="$("${LOGINCTL_BIN}" show-session "${sid}" -p User -p Type -p Seat -p TTY 2>/dev/null)"; then
+            err "Cannot inspect login session ${sid}."
+            unavailable=true
+            continue
+        fi
+        user="$(_session_property "${properties}" User)"
+        type="$(_session_property "${properties}" Type)"
+        if [[ -z "${user}" || -z "${type}" ]]; then
+            err "Incomplete identity for login session ${sid}."
+            unavailable=true
+            continue
+        fi
+        [[ "${user}" == "${REAL_UID}" ]] || continue
+        case "${type}" in
+            x11|wayland|mir)
+                printf 'conflict: graphical login session %s (%s)\n' "${sid}" "${type}"
+                conflict=true ;;
+            tty)
+                seat="$(_session_property "${properties}" Seat)"
+                tty="$(_session_property "${properties}" TTY)"
+                if [[ "${seat}" == seat0 && "${tty}" == "${TTY_NAME}" ]]; then
+                    printf 'login: session %s, %s, %s\n' "${sid}" "${seat}" "${tty}"
+                    login_found=true
+                fi ;;
+        esac
+    done <<< "${sessions}"
+    if [[ "${login_found}" != true ]]; then
+        err "No matching ${TTY_NAME}/seat0 login for the target UID."
+        unavailable=true
+    fi
+
+    # Include graphical-session.target to catch a desktop using another DE.
+    units='graphical-session.target plasma-workspace-wayland.target plasma-kwin_wayland.service plasma-plasmashell.service'
+    for unit in ${units}; do
+        if ! properties="$(_run_as_user "${SYSTEMCTL_BIN}" --user show "${unit}" -p LoadState -p ActiveState 2>/dev/null)"; then
+            err "Cannot inspect user unit ${unit}."
+            unavailable=true
+            continue
+        fi
+        load="$(_session_property "${properties}" LoadState)"
+        state="$(_session_property "${properties}" ActiveState)"
+        printf 'unit: %s load=%s state=%s\n' "${unit}" "${load:-unknown}" "${state:-unknown}"
+        if [[ "${load}" != loaded ]]; then
+            unavailable=true
+        else
+            case "${state}" in
+                inactive) ;;
+                active|activating|deactivating|reloading|refreshing) conflict=true ;;
+                *) unavailable=true ;;
+            esac
+        fi
+    done
+    printf 'This check does not validate scope launch, DRM access or streaming.\n'
+    if [[ "${unavailable}" == true ]]; then return 2; fi
+    if [[ "${conflict}" == true ]]; then return 1; fi
+    printf 'Known login and unit prerequisites are clear for a new execution.\n'
+}
+
 cmd_detect_gpu() {
     _LOG_CTX="detect-gpu"
     resolve_plasma_drm_device >/dev/null 2>&1 || true
@@ -915,7 +1066,7 @@ wait_for() {
             return 1
         fi
         sleep 0.2
-        (( waited_ticks++ ))
+        (( waited_ticks += 1 ))
     done
     local sec=$(( waited_ticks / 5 ))
     local tenths=$(( (waited_ticks % 5) * 2 ))
@@ -932,7 +1083,7 @@ wait_gone() {
             return 1
         fi
         sleep 0.2
-        (( waited_ticks++ ))
+        (( waited_ticks += 1 ))
     done
     local sec=$(( waited_ticks / 5 ))
     local tenths=$(( (waited_ticks % 5) * 2 ))
@@ -990,7 +1141,7 @@ _tcp_port_listening() {
 
 _udp_port_listening() {
     local port="$1"
-    ss -lun 2>/dev/null | awk -v p=":${port}" '$5 ~ p"$" {found=1} END{exit !found}'
+    ss -lun 2>/dev/null | awk -v p=":${port}" '$4 ~ p"$" {found=1} END{exit !found}'
 }
 
 check_sunshine_required_tcp_ports() {
@@ -1696,8 +1847,12 @@ _start_sunshine_systemd() {
     else
         _run_as_user "${SYSTEMCTL_BIN}" --user start "${SUNSHINE_UNIT}" 2>/dev/null || true
     fi
-    _wait_sunshine_ready
+    if ! _wait_sunshine_ready; then
+        err "Sunshine did not become stream-ready via the systemd user service."
+        return 1
+    fi
     _warn_if_sunshine_selected_vkms "${journal_since}"
+    return 0
 }
 
 _start_sunshine_supervised() {
@@ -1776,14 +1931,592 @@ _assert_sunshine_gpu_alignment_from_log() {
 # START / STOP COMMANDS
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Experimental backend: desktop units use the user manager, while managed
+# Sunshine uses the restricted system-manager helper. Native desktop units
+# remain separate from the launcher scope.
+_scope_systemctl() { _run_as_user "${SYSTEMCTL_BIN}" --user "$@"; }
+_scope_sunshine_helper() {
+    sudo -n /usr/local/libexec/plasmactl-sunshine "$@"
+}
+
+_scope_sunshine_preflight() {
+    local role="$1" info
+    [[ -z "${SUNSHINE_ARGS}" && -z "${SUNSHINE_CONFIG_PATH}" ]] || {
+        err "The scope backend uses fixed profile paths and accepts no custom Sunshine arguments."; return 1;
+    }
+    case "${SUNSHINE_PROFILE}" in normal|safe|performance) ;; *) err "Unsupported managed Sunshine profile."; return 1 ;; esac
+    case "${role}" in igpu|dgpu) ;; *) err "Select an explicit GPU role for managed Sunshine."; return 1 ;; esac
+    [[ -z "$(_sunshine_newest_pid)" ]] || { err "An existing Sunshine process must be stopped by its owner first."; return 1; }
+    info="$(_scope_sunshine_helper check 00000000000000000000000000000000 "${role}")" || return 1
+    jq -e --arg card "${TARGET_DRM_DEVICE}" --arg render "$(_selected_render_node_plain)" \
+        '.card == $card and .render == $render' <<< "${info}" >/dev/null || {
+        err "Installed Sunshine device policy differs from the selected GPU."; return 1;
+    }
+}
+
+_scope_prepare_sunshine_config() {
+    local target apps stage
+    case "${SUNSHINE_PROFILE}" in
+        normal) [[ -f "${SUNSHINE_DEFAULT_CONFIG}" ]] || { err "Normal Sunshine config is missing."; return 1; }; return 0 ;;
+        safe) target="${SUNSHINE_SAFE_CONFIG}"; apps="${SUNSHINE_SAFE_APPS}" ;;
+        performance) target="${SUNSHINE_PERF_CONFIG}"; apps="${SUNSHINE_PERF_APPS}" ;;
+        *) return 1 ;;
+    esac
+    # Existing settings and application lists are operator-owned. Generate only
+    # absent assets, publishing each without replacing a concurrent edit.
+    [[ ! -e "${target}" && ! -L "${target}" ]] || { [[ -f "${target}" ]] && return 0; return 1; }
+    stage="$(mktemp -d "${SUNSHINE_CONFIG_DIR}/.plasmactl-profile.XXXXXX")" || return 1
+    local SUNSHINE_SAFE_CONFIG="${stage}/$(basename "${SUNSHINE_SAFE_CONFIG}")"
+    local SUNSHINE_SAFE_APPS="${stage}/$(basename "${SUNSHINE_SAFE_APPS}")"
+    local SUNSHINE_PERF_CONFIG="${stage}/$(basename "${SUNSHINE_PERF_CONFIG}")"
+    local SUNSHINE_PERF_APPS="${stage}/$(basename "${SUNSHINE_PERF_APPS}")"
+    local result=0
+    if [[ "${SUNSHINE_PROFILE}" == safe ]]; then
+        _write_sunshine_safe_assets >&2 || result=$?
+    else
+        _write_sunshine_performance_assets >&2 || result=$?
+    fi
+    if (( result == 0 )); then
+        # Generated configs for the managed backend retain Sunshine's secure
+        # WAN default. Existing user configs are never rewritten here.
+        sed -i 's/^wan_encryption_mode = 0$/wan_encryption_mode = 2/' "${stage}/$(basename "${target}")" || result=$?
+        if [[ ! -e "${apps}" && ! -L "${apps}" ]]; then
+            ln -- "${stage}/$(basename "${apps}")" "${apps}" || result=$?
+        fi
+        if (( result == 0 )); then
+            ln -- "${stage}/$(basename "${target}")" "${target}" || result=$?
+        fi
+    fi
+    rm -rf -- "${stage}"
+    return "${result}"
+}
+
+_scope_wayland_display() {
+    local run="$1" properties pid entry display=""
+    properties="$(_scope_unit plasma-plasmashell.service)" || return 1
+    pid="$(_scope_property "${properties}" MainPID)"
+    _scope_pid_owned "${pid}" "${run}" || return 1
+    while IFS= read -r -d '' entry; do
+        case "${entry}" in WAYLAND_DISPLAY=*) display="${entry#WAYLAND_DISPLAY=}" ;; esac
+    done < "/proc/${pid}/environ"
+    [[ "${display}" =~ ^wayland-[0-9]+$ && -S "${RUNTIME_DIR}/${display}" &&
+       ! -L "${RUNTIME_DIR}/${display}" && "$(stat -c %u "${RUNTIME_DIR}/${display}")" == "${REAL_UID}" ]] || return 1
+    printf '%s\n' "${display}"
+}
+
+_scope_sunshine_info() {
+    local run role info expected
+    run="$(jq -r '.run' "${SCOPE_STATE_FILE}")" || return 1
+    role="$(jq -r '.sunshine.role' "${SCOPE_STATE_FILE}")" || return 1
+    expected="plasmactl-sunshine-u${REAL_UID}-${role}@${run}.service"
+    info="$(_scope_sunshine_helper status "${run}" "${role}")" || return 1
+    jq -e --arg unit "${expected}" '.unit == $unit and (.recorded|type == "boolean")
+        and (.state|type == "string") and (.invocation|type == "string")
+        and (.listeners|type == "array" and all(.[]; type == "number"))' <<< "${info}" >/dev/null || return 1
+    printf '%s\n' "${info}"
+}
+
+_scope_sunshine_ready() {
+    local info="$1" invocation port
+    invocation="$(jq -r '.sunshine.invocation // empty' "${SCOPE_STATE_FILE}")" || return 1
+    [[ -n "${invocation}" ]] || return 1
+    jq -e --arg invocation "${invocation}" '.recorded and .state == "active" and .invocation == $invocation' \
+        <<< "${info}" >/dev/null || return 1
+    for port in ${SUNSHINE_REQUIRED_TCP_PORTS}; do
+        [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+        jq -e --argjson port "${port}" '.listeners|index($port) != null' <<< "${info}" >/dev/null || return 1
+    done
+}
+
+_scope_start_sunshine() {
+    local run="$1" sid="$2" role="$3" display info invocation ticks=0 result=0
+    display="$(_scope_wayland_display "${run}")" || { err "No owned Wayland socket is ready."; return 1; }
+    _scope_update --arg role "${role}" --arg profile "${SUNSHINE_PROFILE}" --arg display "${display}" \
+        '.sunshine = {role:$role,profile:$profile,display:$display,invocation:null}' || return 1
+    _scope_sunshine_helper start "${run}" "${role}" "${sid}" "${display}" "${SUNSHINE_PROFILE}" >/dev/null || result=$?
+    # Query even after a failed start: the manager may have activated the unit
+    # before a later readiness query failed. Preserve its identity for rollback.
+    info="$(_scope_sunshine_info)" || return 1
+    invocation="$(jq -r '.invocation' <<< "${info}")"
+    if [[ "${invocation}" =~ ^[a-f0-9]{32}$ ]] && jq -e '.recorded' <<< "${info}" >/dev/null; then
+        _scope_update --arg invocation "${invocation}" '.sunshine.invocation = $invocation' || return 1
+    fi
+    (( result == 0 )) || return "${result}"
+    while (( ticks < WAIT_SUNSHINE_PORTS )); do
+        _scope_sunshine_ready "${info}" && return 0
+        [[ "$(jq -r '.state' <<< "${info}")" == active ]] || break
+        sleep 1
+        (( ticks += 1 ))
+        info="$(_scope_sunshine_info)" || return 1
+    done
+    err "Owned Sunshine did not open the required TCP listeners."
+    return 1
+}
+
+_scope_stop_sunshine() {
+    jq -e '.sunshine != null' "${SCOPE_STATE_FILE}" >/dev/null || return 0
+    local info run role invocation current
+    info="$(_scope_sunshine_info)" || return 1
+    run="$(jq -r '.run' "${SCOPE_STATE_FILE}")"
+    role="$(jq -r '.sunshine.role' "${SCOPE_STATE_FILE}")"
+    invocation="$(jq -r '.sunshine.invocation // empty' "${SCOPE_STATE_FILE}")"
+    current="$(jq -r '.invocation' <<< "${info}")"
+    case "$(jq -r '.state' <<< "${info}")" in
+        inactive|failed) ;;
+        *) [[ -n "${invocation}" && "${invocation}" == "${current}" ]] || {
+            err "Sunshine invocation changed or was not recorded; refusing stop."; return 1;
+        } ;;
+    esac
+    if jq -e '.recorded' <<< "${info}" >/dev/null; then
+        _scope_sunshine_helper stop "${run}" "${role}" "${invocation:-00000000000000000000000000000000}" >/dev/null || return 1
+    fi
+    _scope_update '.sunshine.stopped = true'
+}
+_scope_boot_id() { cat /proc/sys/kernel/random/boot_id; }
+_scope_property() { _session_property "$1" "$2"; }
+_scope_unit() {
+    local properties status=0
+    properties="$(_scope_systemctl show -p Id -p LoadState -p ActiveState -p InvocationID -p MainPID -p PartOf -- "$1")" || status=$?
+    # A collected transient scope is expected absence. Query/permission failures
+    # must remain distinguishable from a unit that no longer exists.
+    if (( status != 0 )) && [[ "$(_scope_property "${properties}" LoadState)" != not-found ]]; then
+        return "${status}"
+    fi
+    printf '%s\n' "${properties}"
+}
+_scope_update() {
+    local candidate
+    candidate="$(mktemp "${SCOPE_STATE_FILE}.XXXXXX")" || return 1
+    if ! jq "$@" "${SCOPE_STATE_FILE}" > "${candidate}"; then
+        rm -- "${candidate}"
+        return 1
+    fi
+    chmod 600 "${candidate}" && mv -- "${candidate}" "${SCOPE_STATE_FILE}"
+}
+_scope_load() {
+    command -v jq >/dev/null || { err "The scope backend requires jq."; return 1; }
+    [[ -f "${SCOPE_STATE_FILE}" && ! -L "${SCOPE_STATE_FILE}" ]] || return 1
+    jq -e --arg uid "${REAL_UID}" --arg boot "$(_scope_boot_id)" '
+        .schema == 1 and (.uid|tostring) == $uid and .boot == $boot
+        and (.run|type == "string" and test("^[a-f0-9]{32}$"))
+        and .scope == ("plasmactl-plasma-" + .run + ".scope")
+        and (.sid|type == "string" and test("^[a-zA-Z0-9_-]+$"))
+        and (.tty|type == "string" and test("^tty[0-9]+$"))
+        and (.gpu|type == "string" and test("^/dev/dri/card[0-9]+$"))
+        and (.phase == "starting" or .phase == "running")
+        and (.environment_before|type == "object" and all(.[]; type == "string"))
+        and ((.environment_after // {})|type == "object" and all(.[]; type == "string"))
+        and (.baseline_active|type == "array" and all(.[]; type == "string"))
+        and (.units|type == "object")
+        and (.units|to_entries|all(.key|test("^[a-zA-Z0-9_.@:\\\\-]+\\.(service|scope|target)$")))
+        and (.units|to_entries|all(.value|type == "string" and test("^[a-f0-9]{32}$")))
+        and (.sunshine == null or (.sunshine|type == "object"
+            and (.role == "igpu" or .role == "dgpu")
+            and (.profile == "normal" or .profile == "safe" or .profile == "performance")
+            and (.display|type == "string" and test("^wayland-[0-9]+$"))
+            and (.invocation == null or (.invocation|type == "string" and test("^[a-f0-9]{32}$")))))
+    ' "${SCOPE_STATE_FILE}" >/dev/null || {
+        err "Scope state is invalid or belongs to another boot/user; preserving it for review."
+        return 1
+    }
+}
+_scope_manager_environment() {
+    _run_as_user busctl --user --json=short get-property \
+        org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+        org.freedesktop.systemd1.Manager Environment |
+        jq -ce 'if .type != "as" or (.data|type) != "array" then error("invalid manager environment") else
+            [.data[] | capture("^(?<key>[^=]+)=(?<value>.*)$"; "s") |
+            select(.key | test("^(PLASMACTL_RUN_ID|KWIN_DRM_DEVICES|KWIN_RENDER_NODES|XDG_SESSION_ID|XDG_SESSION_TYPE|XDG_CURRENT_DESKTOP|KDE_FULL_SESSION|WAYLAND_DISPLAY|DISPLAY|DBUS_SESSION_BUS_ADDRESS)$"))] | from_entries end'
+}
+_scope_graph_units() {
+    local active unit properties relations members=""
+    # Enumerate raw names as JSON. Query PartOf on active units instead of
+    # relying on a target object that may be garbage-collected while inactive.
+    active="$(_scope_systemctl list-units --all --state=active,activating,reloading,deactivating --output=json --no-pager |
+        jq -r '.[].unit')" || return 1
+    while read -r unit; do
+        [[ -n "${unit}" ]] || continue
+        properties="$(_scope_unit "${unit}")" || return 1
+        relations="$(_scope_property "${properties}" PartOf)"
+        case " ${relations} " in
+            *" graphical-session.target "*) members+="${unit}"$'\n' ;;
+        esac
+    done <<< "${active}"
+    {
+        printf '%s\n' graphical-session.target graphical-session-pre.target \
+            plasma-workspace-wayland.target plasma-workspace.target plasma-core.target \
+            plasma-kwin_wayland.service plasma-plasmashell.service
+        printf '%s' "${members}"
+    } | sort -u
+}
+
+_scope_validate_login() {
+    local sid="$1" properties
+    properties="$("${LOGINCTL_BIN}" show-session "${sid}" -p User -p Seat -p TTY)" || return 1
+    [[ "$(_scope_property "${properties}" User)" == "${REAL_UID}" &&
+       "$(_scope_property "${properties}" Seat)" == seat0 &&
+       "$(_scope_property "${properties}" TTY)" == "${TTY_NAME}" ]]
+}
+_scope_pid_owned() {
+    local pid="$1" run="$2" sid gpu
+    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+    sid="$(jq -er '.sid' "${SCOPE_STATE_FILE}")" || return 1
+    gpu="$(jq -er '.gpu' "${SCOPE_STATE_FILE}")" || return 1
+    # Match whole NUL-delimited entries, not path or token substrings.
+    grep -zFxq -- "PLASMACTL_RUN_ID=${run}" "/proc/${pid}/environ" 2>/dev/null &&
+        grep -zFxq -- "XDG_SESSION_ID=${sid}" "/proc/${pid}/environ" 2>/dev/null &&
+        grep -zFxq -- "KWIN_DRM_DEVICES=${gpu}" "/proc/${pid}/environ" 2>/dev/null
+}
+_scope_capture_unit() {
+    local unit="$1" run="$2" graph_proof="${3:-false}" properties state invocation known pid
+    local unit_pattern='^[a-zA-Z0-9_.@:\\-]+\.(service|scope|target)$'
+    [[ "${unit}" =~ ${unit_pattern} ]] || { err "Invalid unit identity ${unit}."; return 1; }
+    properties="$(_scope_unit "${unit}")" || return 1
+    state="$(_scope_property "${properties}" ActiveState)"
+    case "${state}" in inactive|failed) return 0 ;; active|activating|reloading) ;; *) return 1 ;; esac
+    invocation="$(_scope_property "${properties}" InvocationID)"
+    [[ "${invocation}" =~ ^[a-f0-9]{32}$ ]] || return 1
+    known="$(jq -r --arg u "${unit}" '.units[$u] // empty' "${SCOPE_STATE_FILE}")" || return 1
+    if [[ -n "${known}" ]]; then
+        [[ "${known}" == "${invocation}" ]] || { err "Invocation changed for ${unit}; refusing adoption."; return 1; }
+    elif [[ "${unit}" == *.service ]]; then
+        pid="$(_scope_property "${properties}" MainPID)"
+        if ! _scope_pid_owned "${pid}" "${run}"; then
+            case "${unit}" in
+                plasma-kwin_wayland.service|plasma-plasmashell.service)
+                    err "Cannot prove compositor/shell ownership for ${unit}."; return 1 ;;
+            esac
+            # PartOf is an explicit lifetime relationship to the owned desktop.
+            # Require the complete pre-launch active-unit baseline as well.
+            if [[ "${graph_proof}" != true ]] || ! jq -e --arg u "${unit}" \
+                '(.baseline_active|type == "array") and ((.baseline_active|index($u)) == null)' \
+                "${SCOPE_STATE_FILE}" >/dev/null; then
+                err "Cannot prove graph ownership of ${unit}."
+                return 1
+            fi
+        fi
+    elif [[ "${unit}" == *.scope ]]; then
+        [[ "${unit}" == "plasmactl-plasma-${run}.scope" ]] || return 1
+    else
+        case "${unit}" in
+            graphical-session.target|graphical-session-pre.target|plasma-workspace-wayland.target|plasma-workspace.target|plasma-core.target) ;;
+            *) err "Unrecognized desktop target ${unit}."; return 1 ;;
+        esac
+    fi
+    _scope_update --arg u "${unit}" --arg i "${invocation}" '.units[$u] = $i'
+}
+_scope_capture_graph() {
+    local run="$1" units unit anchor pid
+    anchor="$(_scope_unit plasma-kwin_wayland.service)" || return 1
+    pid="$(_scope_property "${anchor}" MainPID)"
+    _scope_pid_owned "${pid}" "${run}" || { err "No owned compositor anchors this desktop graph."; return 1; }
+    units="$(_scope_graph_units)" || return 1
+    while read -r unit; do
+        [[ -n "${unit}" ]] || continue
+        _scope_capture_unit "${unit}" "${run}" true || return 1
+    done <<< "${units}"
+}
+_scope_match_unit() {
+    local unit="$1" expected="$2" properties state current
+    properties="$(_scope_unit "${unit}")" || return 1
+    state="$(_scope_property "${properties}" ActiveState)"
+    case "${state}" in inactive|failed) return 0 ;; esac
+    current="$(_scope_property "${properties}" InvocationID)"
+    [[ "${current}" == "${expected}" && -n "${current}" ]] || {
+        err "Refusing to control a different invocation of ${unit}."
+        return 1
+    }
+}
+_scope_restore_environment() {
+    local current before after key value
+    current="$(_scope_manager_environment)" || return 1
+    before="$(jq -c '.environment_before' "${SCOPE_STATE_FILE}")" || return 1
+    after="$(jq -c '.environment_after // {}' "${SCOPE_STATE_FILE}")" || return 1
+    while read -r key; do
+        [[ -n "${key}" ]] || continue
+        # Another actor may have updated the environment during shutdown.
+        if ! jq -e --arg k "${key}" --argjson now "${current}" --argjson after "${after}" \
+            '($now|has($k)) == ($after|has($k)) and $now[$k] == $after[$k]' <<< '{}' >/dev/null; then
+            continue
+        fi
+        if jq -e --arg k "${key}" 'has($k)' <<< "${before}" >/dev/null; then
+            value="$(jq -r --arg k "${key}" '.[$k]' <<< "${before}")" || return 1
+            _scope_systemctl set-environment "${key}=${value}" || return 1
+        else
+            _scope_systemctl unset-environment "${key}" || return 1
+        fi
+    done < <(jq -r --argjson before "${before}" '(. + $before)|keys[]' <<< "${after}")
+}
+_scope_status() {
+    _scope_load || return 1
+    local unit invocation properties status=0
+    while IFS=$'\t' read -r unit invocation; do
+        _scope_match_unit "${unit}" "${invocation}" || return 1
+        properties="$(_scope_unit "${unit}")" || return 1
+        printf '%s: %s\n' "${unit}" "$(_scope_property "${properties}" ActiveState)"
+        [[ "$(_scope_property "${properties}" ActiveState)" == active ]] || status=1
+    done < <(jq -r '.units|to_entries[]|.key + "\t" + .value' "${SCOPE_STATE_FILE}")
+    jq -e '.phase == "running" and (.units[.scope] != null)
+        and (.units["plasma-kwin_wayland.service"] != null)
+        and (.units["plasma-plasmashell.service"] != null)' "${SCOPE_STATE_FILE}" >/dev/null || status=1
+    if jq -e '.sunshine != null' "${SCOPE_STATE_FILE}" >/dev/null; then
+        local info
+        info="$(_scope_sunshine_info)" || return 1
+        printf 'Owned Sunshine: %s\n' "$(jq -r '.state' <<< "${info}")"
+        _scope_sunshine_ready "${info}" || status=1
+    else
+        printf 'Plasma-only execution; Sunshine is disabled.\n'
+    fi
+    return "${status}"
+}
+_scope_stop() {
+    _scope_load || return 1
+    local run scope unit invocation properties units remaining ticks=0
+    run="$(jq -r '.run' "${SCOPE_STATE_FILE}")"
+    scope="$(jq -r '.scope' "${SCOPE_STATE_FILE}")"
+    # Require the recorded launcher identity; do not infer ownership from a name.
+    invocation="$(jq -r --arg u "${scope}" '.units[$u] // empty' "${SCOPE_STATE_FILE}")"
+    [[ -n "${invocation}" ]] || { err "Launcher identity was not recorded; manual review is required."; return 1; }
+    _scope_match_unit "${scope}" "${invocation}" || return 1
+    # An incomplete startup or late desktop autostart may need a refresh.
+    # Refresh only while the original scope and both core process identities
+    # still prove the desktop execution. Otherwise retain the strict record.
+    properties="$(_scope_unit "${scope}")" || return 1
+    if [[ "$(_scope_property "${properties}" ActiveState)" == active ]]; then
+        local core owned_cores=true
+        for core in plasma-kwin_wayland.service plasma-plasmashell.service; do
+            properties="$(_scope_unit "${core}")" || return 1
+            if ! _scope_pid_owned "$(_scope_property "${properties}" MainPID)" "${run}"; then
+                owned_cores=false
+            fi
+        done
+        if [[ "${owned_cores}" == true ]]; then
+            _scope_capture_graph "${run}" || return 1
+        fi
+    fi
+    local graph known
+    graph="$(_scope_graph_units)" || return 1
+    while read -r unit; do
+        [[ -n "${unit}" ]] || continue
+        properties="$(_scope_unit "${unit}")" || return 1
+        case "$(_scope_property "${properties}" ActiveState)" in inactive|failed) continue ;; esac
+        known="$(jq -r --arg u "${unit}" '.units[$u] // empty' "${SCOPE_STATE_FILE}")" || return 1
+        [[ -n "${known}" ]] || { err "Unrecorded active desktop dependency ${unit}; refusing stop."; return 1; }
+        _scope_match_unit "${unit}" "${known}" || return 1
+    done <<< "${graph}"
+    units="$(jq -r '.units|to_entries[]|.key + "\t" + .value' "${SCOPE_STATE_FILE}")" || return 1
+    # Validate the entire set before issuing any stop operation.
+    while IFS=$'\t' read -r unit invocation; do
+        _scope_match_unit "${unit}" "${invocation}" || return 1
+    done <<< "${units}"
+    # The root helper independently rechecks the system-manager invocation.
+    # Streaming must end before any desktop unit receives a stop request.
+    _scope_stop_sunshine || return 1
+    while IFS=$'\t' read -r unit invocation; do
+        _scope_match_unit "${unit}" "${invocation}" || return 1
+        properties="$(_scope_unit "${unit}")" || return 1
+        case "$(_scope_property "${properties}" ActiveState)" in inactive|failed) continue ;; esac
+        _scope_systemctl --no-block stop -- "${unit}" || return 1
+    done <<< "${units}"
+    while :; do
+        remaining=false
+        while IFS=$'\t' read -r unit invocation; do
+            _scope_match_unit "${unit}" "${invocation}" || return 1
+            properties="$(_scope_unit "${unit}")" || return 1
+            case "$(_scope_property "${properties}" ActiveState)" in inactive|failed) ;; *) remaining=true ;; esac
+        done <<< "${units}"
+        [[ "${remaining}" == true ]] || break
+        if (( ticks >= WAIT_STOP * 5 )); then
+            err "Timed out stopping owned units; state retained."
+            return 1
+        fi
+        sleep 0.2
+        (( ticks += 1 ))
+    done
+    _scope_restore_environment || return 1
+    rm -- "${SCOPE_STATE_FILE}"
+    log "Owned Plasma execution stopped; unrelated process names were not signalled."
+}
+_scope_activate_login() {
+    local sid="$1"
+    [[ "$(get_session_active_state "${sid}")" == yes ]] && return 0
+    _bool_true "${ACTIVATE_TTY_ON_START}" || { err "The scope backend requires its login to be active."; return 1; }
+    "${LOGINCTL_BIN}" --no-ask-password activate "${sid}" || {
+        err "Cannot activate the login non-interactively; no scope has been launched."
+        return 1
+    }
+    local ticks=0
+    while (( ticks < TTY_ACTIVATE_TIMEOUT * 5 )); do
+        [[ "$(get_session_active_state "${sid}")" == yes ]] && return 0
+        sleep 0.2
+        (( ticks += 1 ))
+    done
+    err "The selected login did not become active."
+    return 1
+}
+_scope_check_sunshine_autostart() {
+    local properties dependencies unit load
+    properties="$(_scope_systemctl show -p Wants -p Requires -- graphical-session.target)" || return 1
+    dependencies="$(_scope_property "${properties}" Wants) $(_scope_property "${properties}" Requires)"
+    for unit in "${SUNSHINE_UNIT}" sunshine.service app-dev.lizardbyte.app.Sunshine.service; do
+        case " ${dependencies} " in
+            *" ${unit} "*)
+                properties="$(_scope_unit "${unit}")" || return 1
+                load="$(_scope_property "${properties}" LoadState)"
+                if [[ "${load}" != masked ]]; then
+                    err "Desktop autostart would launch ${unit}; managed starts require it to be explicitly disabled or runtime-masked."
+                    return 1
+                fi ;;
+        esac
+    done
+}
+_scope_start_transaction() {
+    local sid run scope before unit properties pane launcher env_after baseline role ticks=0
+    [[ "${EUID}" -ne 0 ]] || { err "Run the scope backend as the desktop user, without sudo."; return 1; }
+    if [[ -e "${SCOPE_STATE_FILE}" || -L "${SCOPE_STATE_FILE}" ]]; then
+        err "An execution record already exists; inspect status or stop it before starting again."
+        return 1
+    fi
+    for launcher in jq busctl systemd-run startplasma-wayland; do
+        command -v "${launcher}" >/dev/null || { err "Missing executable: ${launcher}"; return 1; }
+    done
+    cmd_session_check || return $?
+    _scope_check_sunshine_autostart || return 1
+    sid="$(get_tty_session_id)"
+    _scope_validate_login "${sid}" || { err "Login identity does not match user/seat/TTY."; return 1; }
+    check_tmux_session || { err "Configured tmux session is unavailable."; return 1; }
+    # Reject already-running dependents, even if the desktop target is inactive.
+    properties="$(_scope_graph_units)" || return 1
+    while read -r unit; do
+        [[ -n "${unit}" ]] || continue
+        before="$(_scope_unit "${unit}")" || return 1
+        case "$(_scope_property "${before}" ActiveState)" in
+            inactive) ;;
+            *) err "Desktop dependency ${unit} is not inactive; refusing adoption."; return 1 ;;
+        esac
+    done <<< "${properties}"
+    resolve_plasma_drm_device || return 1
+    _require_kms_output_ready || return 1
+    local render
+    render="$(_selected_render_node_plain)" || return 1
+    [[ "${render}" =~ ^/dev/dri/renderD[0-9]+$ ]] || {
+        err "No render node belongs to the selected GPU."; return 1;
+    }
+    role="$(_effective_gpu_role)"
+    if _bool_true "${SUNSHINE_SUPERVISE}"; then
+        _scope_sunshine_preflight "${role}" || return 1
+        _scope_prepare_sunshine_config || return 1
+    fi
+    before="$(_scope_manager_environment)" || return 1
+    baseline="$(_scope_systemctl list-units --all --output=json --no-pager |
+        jq -ce '[.[] | select(.active != "inactive" and .active != "failed") | .unit]')" || return 1
+    run="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+    scope="plasmactl-plasma-${run}.scope"
+    # Create without overwriting an existing state record, including symlinks.
+    (umask 077; set -o noclobber; jq -n --arg uid "${REAL_UID}" --arg boot "$(_scope_boot_id)" \
+        --arg run "${run}" --arg sid "${sid}" --arg tty "${TTY_NAME}" --arg gpu "${TARGET_DRM_DEVICE}" \
+        --arg scope "${scope}" --argjson before "${before}" --argjson baseline "${baseline}" \
+        '{schema:1,phase:"starting",uid:$uid,boot:$boot,run:$run,sid:$sid,tty:$tty,gpu:$gpu,scope:$scope,units:{},baseline_active:$baseline,environment_before:$before}' > "${SCOPE_STATE_FILE}") || return 1
+    SCOPE_ATTEMPT_RUN="${run}"
+    _scope_activate_login "${sid}" || return 1
+    launcher="$(command -v systemd-run)"
+    pane="$(_run_as_user "${TMUX_BIN}" new-window -d -P -F '#{pane_id}' -t "${SESSION}" \
+        -n "plasmactl-${run:0:8}" -c "${REAL_HOME}" -- \
+        "${launcher}" --user --scope --unit="${scope}" \
+        /usr/bin/env "PLASMACTL_RUN_ID=${run}" "XDG_SESSION_ID=${sid}" \
+        "XDG_RUNTIME_DIR=${RUNTIME_DIR}" "DBUS_SESSION_BUS_ADDRESS=unix:path=${RUNTIME_DIR}/bus" \
+        "KWIN_DRM_DEVICES=${TARGET_DRM_DEVICE}" "KWIN_RENDER_NODES=${render}" XDG_SESSION_TYPE=wayland \
+        XDG_CURRENT_DESKTOP=KDE KDE_FULL_SESSION=true "$(command -v startplasma-wayland)")" || return 1
+    _scope_update --arg pane "${pane}" '.pane = $pane' || return 1
+    while (( ticks < WAIT_PLASMA * 5 )); do
+        properties="$(_scope_unit "${scope}")" || return 1
+        if [[ "$(_scope_property "${properties}" ActiveState)" == active ]]; then
+            _scope_capture_unit "${scope}" "${run}" || return 1
+            break
+        fi
+        sleep 0.2
+        (( ticks += 1 ))
+    done
+    [[ "$(jq '.units|length' "${SCOPE_STATE_FILE}")" -gt 0 ]] || {
+        err "Scope did not become active; state retained for review."
+        return 1
+    }
+    ticks=0
+    while (( ticks < WAIT_PLASMA * 5 )); do
+        properties="$(_scope_unit plasma-plasmashell.service)" || return 1
+        if [[ "$(_scope_property "${properties}" ActiveState)" == active ]]; then
+            properties="$(_scope_unit plasma-kwin_wayland.service)" || return 1
+            if [[ "$(_scope_property "${properties}" ActiveState)" == active ]]; then
+                properties="$(_scope_unit plasma-workspace-wayland.target)" || return 1
+                if [[ "$(_scope_property "${properties}" ActiveState)" == active ]]; then break; fi
+            fi
+        fi
+        sleep 0.2
+        (( ticks += 1 ))
+    done
+    env_after="$(_scope_manager_environment)" || return 1
+    _scope_update --argjson after "${env_after}" '.environment_after = $after' || return 1
+    if (( ticks >= WAIT_PLASMA * 5 )); then
+        err "Native Plasma units did not become active; state retained."
+        return 1
+    fi
+    _scope_capture_graph "${run}" || return 1
+    local display
+    display="$(_scope_wayland_display "${run}")" || { err "Owned Wayland endpoint is unavailable."; return 1; }
+    _scope_update --arg display "${display}" '.wayland = $display' || return 1
+    if _bool_true "${SUNSHINE_SUPERVISE}"; then
+        _scope_start_sunshine "${run}" "${sid}" "${role}" || return 1
+    fi
+    _scope_update '.phase = "running"' || return 1
+    _scope_status
+}
+
+_scope_start() {
+    local result=0 run scope properties graph unit untouched=true
+    SCOPE_ATTEMPT_RUN=""
+    if _scope_start_transaction; then return 0; else result=$?; fi
+    [[ -n "${SCOPE_ATTEMPT_RUN}" ]] || return "${result}"
+    _scope_load || return "${result}"
+    run="$(jq -r '.run' "${SCOPE_STATE_FILE}")" || return "${result}"
+    [[ "${run}" == "${SCOPE_ATTEMPT_RUN}" ]] || return "${result}"
+    scope="$(jq -r '.scope' "${SCOPE_STATE_FILE}")" || return "${result}"
+    properties="$(_scope_unit "${scope}")" || return "${result}"
+    case "$(_scope_property "${properties}" ActiveState)" in
+        inactive|failed)
+            graph="$(_scope_graph_units)" || return "${result}"
+            while read -r unit; do
+                [[ -n "${unit}" ]] || continue
+                properties="$(_scope_unit "${unit}")" || return "${result}"
+                case "$(_scope_property "${properties}" ActiveState)" in inactive|failed) ;; *) untouched=false ;; esac
+            done <<< "${graph}"
+            if [[ "${untouched}" == true ]] && ! jq -e '.sunshine != null' "${SCOPE_STATE_FILE}" >/dev/null; then
+                rm -- "${SCOPE_STATE_FILE}"
+                err "Startup failed before any desktop unit remained active; execution state cleared."
+                return "${result}"
+            fi ;;
+    esac
+    err "Startup failed; attempting rollback of the identified execution."
+    if ! _scope_stop; then
+        err "Rollback could not prove or stop every component; state retained for review."
+    fi
+    return "${result}"
+}
+
 cmd_start() {
     _LOG_CTX="start"
+    acquire_lock || return 1
     : > "${START_LOG}"
     : > "${LAST_LOG}"
     exec > >(tee -a "${START_LOG}") 2>&1
 
-    acquire_lock
     log "─── plasmactl start v${VERSION} (user=${REAL_USER}) ───"
+    case "${PLASMA_SESSION_BACKEND}" in
+        systemd-scope) _scope_start; return $? ;;
+        legacy) [[ ! -e "${SCOPE_STATE_FILE}" && ! -L "${SCOPE_STATE_FILE}" ]] || {
+            err "Scope state exists; refusing legacy start."; return 1;
+        } ;;
+        *) err "Unknown PLASMA_SESSION_BACKEND=${PLASMA_SESSION_BACKEND}"; return 2 ;;
+    esac
 
     log "Checking required binaries..."
     check_required_bins || exit 1
@@ -1923,12 +2656,17 @@ _terminate_tty_session_if_requested() {
 
 cmd_stop() {
     _LOG_CTX="stop"
+    acquire_lock || return 1
     : > "${STOP_LOG}"
     exec > >(tee -a "${STOP_LOG}") 2>&1
 
-    acquire_lock
     log "─── plasmactl stop v${VERSION} ───"
 
+    if [[ "${PLASMA_SESSION_BACKEND}" == systemd-scope || -e "${SCOPE_STATE_FILE}" || -L "${SCOPE_STATE_FILE}" ]]; then
+        _scope_stop
+        return $?
+    fi
+    [[ "${PLASMA_SESSION_BACKEND}" == legacy ]] || { err "Unknown session backend."; return 2; }
     _stop_sunshine_if_active
     _stop_plasma_processes
 
@@ -1947,8 +2685,12 @@ cmd_stop() {
 cmd_restart() {
     local args=()
     ${VERBOSE} && args+=(--verbose)
-    "$0" "${args[@]}" stop
+    [[ -n "${PLASMA_GPU_OVERRIDE:-}" ]] && args+=("--gpu=${PLASMA_GPU_OVERRIDE}")
+    [[ "${PLASMA_SESSION_BACKEND}" == legacy ]] || args+=("--session-backend=${PLASMA_SESSION_BACKEND}")
+    # Stop uses the manifest, while --plasma-only is meaningful only on start.
+    "$0" "${args[@]}" stop || return $?
     sleep 2
+    [[ "${PLASMA_ONLY}" != true ]] || args+=(--plasma-only)
     "$0" "${args[@]}" start
 }
 
@@ -2025,7 +2767,13 @@ cmd_status_inner() {
     ${ready} && return 0 || return 1
 }
 
-cmd_status() { _LOG_CTX="status"; cmd_status_inner; }
+cmd_status() {
+    if [[ "${PLASMA_SESSION_BACKEND}" == systemd-scope || -e "${SCOPE_STATE_FILE}" || -L "${SCOPE_STATE_FILE}" ]]; then
+        _scope_status
+        return $?
+    fi
+    _LOG_CTX="status"; cmd_status_inner
+}
 
 cmd_doctor() {
     _LOG_CTX="doctor"
@@ -2035,25 +2783,25 @@ cmd_doctor() {
     echo ""
     printf '\033[1mplasmactl doctor v%s\033[0m\n' "${VERSION}"
     echo "───────────────────────"
-    ${FIX_MODE} && _info "Auto-fix: ENABLED (--fix)" || _info "Auto-fix: disabled"
+    _info "Diagnostics only; automatic repairs are not implemented"
     echo ""
 
     echo "Binaries"; echo "--------"
     for bin in "${REQUIRED_BINS[@]}"; do
-        command -v "${bin}" >/dev/null 2>&1 && _pass "${bin}" || { _fail "${bin}"; ((failures++)); }
+        command -v "${bin}" >/dev/null 2>&1 && _pass "${bin}" || { _fail "${bin}"; ((failures += 1)); }
     done
     command -v sunshine >/dev/null 2>&1 && _pass "sunshine binary" || _warn "sunshine binary not found in PATH"
     echo ""
 
     echo "Getty / ${TTY_NAME}"; echo "------------"
-    "${SYSTEMCTL_BIN}" is-active --quiet "getty@${TTY_NAME}" && _pass "getty@${TTY_NAME} active" || { _fail "getty@${TTY_NAME} inactive"; ((failures++)); }
+    "${SYSTEMCTL_BIN}" is-active --quiet "getty@${TTY_NAME}" && _pass "getty@${TTY_NAME} active" || { _fail "getty@${TTY_NAME} inactive"; ((failures += 1)); }
     if check_tty_session; then
         sid="$(get_tty_session_id)"
         _pass "${TTY_NAME} loginctl session active (session ${sid})"
-        check_tty_seat0 && _pass "${TTY_NAME} on seat0" || { _fail "${TTY_NAME} not on seat0"; ((failures++)); }
+        check_tty_seat0 && _pass "${TTY_NAME} on seat0" || { _fail "${TTY_NAME} not on seat0"; ((failures += 1)); }
         check_tty_active && _pass "${TTY_NAME} is active on seat0" || _warn "${TTY_NAME} is not active now (active VT=$(get_active_tty_name))"
     else
-        _fail "no ${TTY_NAME} session in loginctl"; ((failures++))
+        _fail "no ${TTY_NAME} session in loginctl"; ((failures += 1))
     fi
     echo ""
 
@@ -2071,18 +2819,18 @@ cmd_doctor() {
                 ;;
         esac
     else
-        _fail "No usable DRM target selected"; ((failures++))
+        _fail "No usable DRM target selected"; ((failures += 1))
     fi
     _print_drm_map
     echo ""
 
     echo "TMUX"; echo "----"
-    check_tmux_session && _pass "session '${SESSION}' exists" || { _fail "session '${SESSION}' not found"; ((failures++)); }
+    check_tmux_session && _pass "session '${SESSION}' exists" || { _fail "session '${SESSION}' not found"; ((failures += 1)); }
     check_tmux_attached && _pass "session '${SESSION}' attached" || _warn "session '${SESSION}' not attached"
     echo ""
 
     echo "Sunshine"; echo "--------"
-    command -v sunshine >/dev/null 2>&1 && _pass "binary: $(command -v sunshine)" || { _fail "sunshine binary not found"; ((failures++)); }
+    command -v sunshine >/dev/null 2>&1 && _pass "binary: $(command -v sunshine)" || { _fail "sunshine binary not found"; ((failures += 1)); }
     _info "start mode: ${SUNSHINE_START_MODE}"
     _info "profile: ${SUNSHINE_PROFILE}"
     if check_sunshine_ready; then
@@ -2169,16 +2917,26 @@ cmd_debug() {
 }
 
 cmd_cleanup() {
+    if [[ -e "${SCOPE_STATE_FILE}" || -L "${SCOPE_STATE_FILE}" ]]; then
+        err "Scope execution state exists; cleanup cannot discard ownership or its lock."
+        return 1
+    fi
     _LOG_CTX="cleanup"
+    acquire_lock || return 1
+    # Recheck after acquiring the lock: start may have created state meanwhile.
+    if [[ -e "${SCOPE_STATE_FILE}" || -L "${SCOPE_STATE_FILE}" ]]; then
+        err "Scope execution state exists; refusing cleanup."
+        return 1
+    fi
     log "Cleaning up state files..."
-    rm -f "${PLASMA_PID_FILE}" "${SUNSHINE_PID_FILE}" "${SESSION_ID_FILE}" "${TARGET_DEVICE_FILE}" "${WAYLAND_DISPLAY_FILE}" "${LOCK_FILE}"
+    rm -f "${PLASMA_PID_FILE}" "${SUNSHINE_PID_FILE}" "${SESSION_ID_FILE}" "${TARGET_DEVICE_FILE}" "${WAYLAND_DISPLAY_FILE}"
     log "Done."
     ls -lh "${STATE_DIR}/" 2>/dev/null || true
 }
 
 cmd_attach() {
     check_tmux_session || { err "tmux session '${SESSION}' not found"; exit 1; }
-    exec _run_as_user "${TMUX_BIN}" attach -t "${SESSION}"
+    _run_as_user "${TMUX_BIN}" attach -t "${SESSION}"
 }
 
 cmd_sunshine_safe() {
@@ -2210,6 +2968,10 @@ cmd_sunshine_profiles() {
 
 cmd_setup() {
     _LOG_CTX="setup"
+    if [[ "${1:-}" == --system ]]; then
+        err "Legacy system setup is retired. Prepare and review the restricted Sunshine integration with tools/prepare-sunshine-integration.py."
+        return 1
+    fi
     mkdir -p "${CONFIG_DIR}" "${SUNSHINE_CONFIG_DIR}" "${PLASMACTL_PROFILE_DIR}"
     if [[ ! -f "${CONFIG_FILE}" ]]; then
         cat > "${CONFIG_FILE}" <<EOF_DEFAULT_CONF
@@ -2250,55 +3012,7 @@ EOF_DEFAULT_CONF
 
     _write_all_profile_assets
 
-    if [[ "${1:-}" == "--system" ]]; then
-        log "Installing system integration for getty@${TTY_NAME}, tmux autologin, and sudoers..."
-        _priv mkdir -p "/etc/systemd/system/getty@${TTY_NAME}.service.d"
-        _priv tee "/etc/systemd/system/getty@${TTY_NAME}.service.d/override.conf" >/dev/null <<EOF_GETTY
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin ${REAL_USER} --noclear %I \$TERM
-EOF_GETTY
-
-        # Detect target user's default login shell profile
-        local user_shell profile_target
-        user_shell="$(getent passwd "${REAL_USER}" | cut -d: -f7 || echo "/bin/bash")"
-        if [[ "${user_shell}" == *"/zsh" ]]; then
-            profile_target="${REAL_HOME}/.zprofile"
-        elif [[ -f "${REAL_HOME}/.bash_profile" ]]; then
-            profile_target="${REAL_HOME}/.bash_profile"
-        else
-            profile_target="${REAL_HOME}/.profile"
-        fi
-
-        if ! grep -q 'BEGIN plasmactl tmux autostart' "${profile_target}" 2>/dev/null; then
-            cat >> "${profile_target}" <<EOF_SHELL_PROFILE
-
-# BEGIN plasmactl tmux autostart
-if [[ "\$(tty)" == "/dev/${TTY_NAME}" ]]; then
-    if ! tmux has-session -t ${SESSION} 2>/dev/null; then
-        tmux new-session -d -s ${SESSION}
-    fi
-    exec tmux attach -t ${SESSION}
-fi
-# END plasmactl tmux autostart
-EOF_SHELL_PROFILE
-            log "Added plasmactl tmux autostart block to ${profile_target}"
-        else
-            log "${profile_target} already contains plasmactl autostart block"
-        fi
-
-        _priv tee /etc/sudoers.d/plasmactl >/dev/null <<EOF_SUDOERS
-${REAL_USER} ALL=(root) NOPASSWD: ${CHVT_BIN}, ${LOGINCTL_BIN}, ${SYSTEMCTL_BIN}, /usr/bin/systemd-run, /usr/bin/journalctl
-EOF_SUDOERS
-        _priv chmod 440 /etc/sudoers.d/plasmactl
-        _priv "${SYSTEMCTL_BIN}" daemon-reload
-        _priv "${SYSTEMCTL_BIN}" restart "getty@${TTY_NAME}" || true
-        log "System integration applied successfully."
-    else
-        echo ""
-        echo "Fresh-install system integration available: plasmactl setup --system"
-        echo "Configures getty@${TTY_NAME} autologin, user shell tmux autostart, and sudoers privileges."
-    fi
+    echo "System integration is prepared separately with tools/prepare-sunshine-integration.py."
 }
 
 cmd_headless_check() {
@@ -2386,6 +3100,7 @@ cmd_headless_edid() {
         params)
             short="${connector_arg:-${HEADLESS_FORCE_OUTPUT}}"
             short="$(_connector_short_name "${short}")"
+            _validate_headless_edid_inputs "${short}" "${HEADLESS_FORCE_MODE}" "${HEADLESS_EDID_FILE}" || return $?
             params="drm.edid_firmware=${short}:edid/${HEADLESS_EDID_FILE} video=${short}:${HEADLESS_FORCE_MODE}e"
             echo "Kernel params for forced EDID:"
             echo "  ${params}"
@@ -2399,6 +3114,7 @@ cmd_headless_edid() {
             bytes="$(wc -c < "${sysfs}/edid" 2>/dev/null || echo 0)"
             [[ "${bytes}" -gt 0 ]] || { err "Connector ${connector} has empty EDID."; return 1; }
             short="$(_connector_short_name "$(basename "${sysfs}")")"
+            _validate_headless_edid_inputs "${short}" "${HEADLESS_FORCE_MODE}" "${edid_file}" || return $?
             dest="/usr/lib/firmware/edid/${edid_file}"
             log "Capturing EDID from $(basename "${sysfs}") to ${dest}..."
             sudo mkdir -p /usr/lib/firmware/edid
@@ -2410,6 +3126,7 @@ cmd_headless_edid() {
             short="${connector_arg:-${HEADLESS_FORCE_OUTPUT}}"
             short="$(_connector_short_name "${short}")"
             edid_file="${file_arg:-${HEADLESS_EDID_FILE}}"
+            _validate_headless_edid_inputs "${short}" "${HEADLESS_FORCE_MODE}" "${edid_file}" || return $?
             dest="/usr/lib/firmware/edid/${edid_file}"
             [[ -r "${dest}" ]] || { err "EDID file not found: ${dest}. Run headless-edid capture first."; return 1; }
             params="drm.edid_firmware=${short}:edid/${edid_file} video=${short}:${HEADLESS_FORCE_MODE}e"
@@ -2421,8 +3138,8 @@ cmd_headless_edid() {
             sudo cp /etc/default/limine "/etc/default/limine.bak.$(date +%Y%m%d-%H%M%S)"
             if ! grep -Fq "drm.edid_firmware=${short}:edid/${edid_file}" /etc/default/limine; then
                 if grep -q '^KERNEL_CMDLINE\[default\]+=' /etc/default/limine; then
-                    # Fixed sed escaping for double-quoted regex
-                    sudo sed -i "/^KERNEL_CMDLINE\[default\]+=/{s/\"$/ ${params}\"/}" /etc/default/limine
+                    sudo sed -i "$(_limine_cmdline_sed_expression "${params}")" /etc/default/limine || return 1
+                    grep -Fq -- "${params}" /etc/default/limine || { err "Could not verify Limine kernel parameters after editing."; return 1; }
                 else
                     printf 'KERNEL_CMDLINE[default]+="%s"\n' "${params}" | sudo tee -a /etc/default/limine >/dev/null
                 fi
@@ -2799,7 +3516,10 @@ Usage: plasmactl [--verbose] <command> [args]
 
 Flags:
   --verbose, -v  Extra diagnostic output
-  --fix          Used with doctor where applicable
+  --fix          Compatibility flag; automatic repairs are not implemented
+  --session-backend=legacy|systemd-scope
+                 Choose the session lifecycle backend (default: legacy)
+  --plasma-only  Start/restart experimental scope backend without Sunshine
 
 Commands:
   start           Launch Plasma + Sunshine on selected real DRM target
@@ -2808,6 +3528,7 @@ Commands:
   status          Health check all components
   doctor          Diagnose prerequisites
   detect-gpu      Show DRM device map and selected target
+  session-check   Inspect login and systemd conflicts before a new execution
   headless-check  Diagnose no-monitor/no-dummy KMS viability
   headless-edid   status|params|capture|install-limine EDID helper
   list            Sessions, tmux, DRM, processes, services, state
@@ -2817,7 +3538,7 @@ Commands:
   attach          Attach to tmux session '${SESSION}'
   sunshine-safe   Generate SAFE Sunshine profile/config
   sunshine-profiles Generate SAFE + PERFORMANCE Sunshine profiles and manifest
-  setup [--system] Create default config/profiles; --system configures getty/tmux/sudoers
+  setup [--user]   Create user config/profiles; legacy --system setup is retired
   config-snapshot Show plasmactl + Sunshine configs/apps
   config-template Write optional JSON overlay config template
   sanity          Full post-boot runtime sanity check
@@ -2844,20 +3565,85 @@ POSITIONAL=()
 while [[ $# -gt 0 ]]; do
     case "${1}" in
         --verbose|-v) VERBOSE=true ;;
+        --help|-h|--system|--user) POSITIONAL+=("${1}") ;;
         --fix) FIX_MODE=true ;;
-        --gpu=*) PLASMA_GPU_OVERRIDE="${1#--gpu=}" ;;
+        --session-backend=*)
+            PLASMA_SESSION_BACKEND="${1#--session-backend=}"
+            case "${PLASMA_SESSION_BACKEND}" in legacy|systemd-scope) ;; *) echo "ERROR: invalid session backend" >&2; exit 2 ;; esac
+            ;;
+        --plasma-only) PLASMA_ONLY=true; SUNSHINE_SUPERVISE=false ;;
+        --gpu=*)
+            PLASMA_GPU_OVERRIDE="${1#--gpu=}"
+            case "${PLASMA_GPU_OVERRIDE}" in
+                igpu|dgpu|auto) ;;
+                *) echo "ERROR: --gpu expects igpu, dgpu, or auto" >&2; exit 2 ;;
+            esac
+            ;;
         --gpu)
-            shift || { echo "ERROR: --gpu requires igpu|dgpu|auto" >&2; exit 1; }
+            if [[ $# -lt 2 || "${2}" == -* ]]; then
+                echo "ERROR: --gpu requires igpu, dgpu, or auto" >&2
+                exit 2
+            fi
+            shift
             PLASMA_GPU_OVERRIDE="${1:-}"
+            case "${PLASMA_GPU_OVERRIDE}" in
+                igpu|dgpu|auto) ;;
+                *) echo "ERROR: --gpu expects igpu, dgpu, or auto" >&2; exit 2 ;;
+            esac
             ;;
         --igpu) PLASMA_GPU_OVERRIDE="igpu" ;;
         --dgpu) PLASMA_GPU_OVERRIDE="dgpu" ;;
         -dgpu|-igpu) echo "ERROR: use --${1#-}, not ${1}. Example: plasmactl --${1#-} start --verbose" >&2; exit 2 ;;
+        -*) echo "ERROR: unknown option '${1}'" >&2; exit 2 ;;
         *) POSITIONAL+=("${1}") ;;
     esac
     shift || true
 done
 set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+
+_validate_cli_arguments() {
+    local command="${POSITIONAL[0]:-}" count=${#POSITIONAL[@]}
+    if [[ "${PLASMA_ONLY}" == true ]]; then
+        if [[ "${PLASMA_SESSION_BACKEND}" != systemd-scope || ( "${command}" != start && "${command}" != restart ) ]]; then
+            echo "ERROR: --plasma-only requires scope backend start or restart" >&2
+            return 2
+        fi
+    fi
+    case "${command}" in
+        start|stop|restart|status|doctor|detect-gpu|session-check|headless-check|list|debug|cleanup|attach|sunshine-safe|sunshine-profiles|profiles|config-snapshot|config-template|sanity|confirm-igpu|confirm-dgpu|gpu-assert|--help|-h|help)
+            [[ "${count}" -le 1 ]] || { echo "ERROR: '${command}' does not accept positional arguments" >&2; return 2; }
+            ;;
+        setup)
+            [[ "${count}" -le 2 ]] || { echo "ERROR: setup accepts at most one mode" >&2; return 2; }
+            if [[ "${count}" -eq 2 && "${POSITIONAL[1]}" != "--system" && "${POSITIONAL[1]}" != "--user" ]]; then
+                echo "ERROR: setup mode must be --system or --user" >&2
+                return 2
+            fi
+            ;;
+        logs)
+            [[ "${count}" -le 3 ]] || { echo "ERROR: logs accepts a target and optional line count" >&2; return 2; }
+            if [[ "${count}" -eq 3 && ! "${POSITIONAL[2]}" =~ ^[0-9]+$ ]]; then
+                echo "ERROR: logs line count must be a non-negative integer" >&2
+                return 2
+            fi
+            ;;
+        headless-edid)
+            [[ "${count}" -le 4 ]] || { echo "ERROR: headless-edid accepts an operation, connector, and optional file" >&2; return 2; }
+            ;;
+        confirm-gpu|confirm)
+            [[ "${count}" -le 2 ]] || { echo "ERROR: ${command} accepts at most one GPU role" >&2; return 2; }
+            ;;
+        "")
+            echo "ERROR: a command is required" >&2
+            return 2
+            ;;
+        *)
+            [[ "${count}" -eq 1 ]] || { echo "ERROR: '${command}' does not accept positional arguments" >&2; return 2; }
+            ;;
+    esac
+}
+
+_validate_cli_arguments || exit $?
 
 case "${1:-}" in
     start)      cmd_start ;;
@@ -2866,6 +3652,7 @@ case "${1:-}" in
     status)     cmd_status ;;
     doctor)     cmd_doctor ;;
     detect-gpu) cmd_detect_gpu ;;
+    session-check) cmd_session_check ;;
     headless-check) cmd_headless_check ;;
     headless-edid)  cmd_headless_edid "$@" ;;
     list)       cmd_list ;;
