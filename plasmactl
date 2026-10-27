@@ -2126,7 +2126,7 @@ _scope_manager_environment() {
         org.freedesktop.systemd1.Manager Environment |
         jq -ce 'if .type != "as" or (.data|type) != "array" then error("invalid manager environment") else
             [.data[] | capture("^(?<key>[^=]+)=(?<value>.*)$"; "s") |
-            select(.key | test("^(PLASMACTL_RUN_ID|KWIN_DRM_DEVICES|XDG_SESSION_ID|XDG_SESSION_TYPE|XDG_CURRENT_DESKTOP|KDE_FULL_SESSION|WAYLAND_DISPLAY|DISPLAY|DBUS_SESSION_BUS_ADDRESS)$"))] | from_entries end'
+            select(.key | test("^(PLASMACTL_RUN_ID|KWIN_DRM_DEVICES|KWIN_RENDER_NODES|XDG_SESSION_ID|XDG_SESSION_TYPE|XDG_CURRENT_DESKTOP|KDE_FULL_SESSION|WAYLAND_DISPLAY|DISPLAY|DBUS_SESSION_BUS_ADDRESS)$"))] | from_entries end'
 }
 _scope_graph_units() {
     local active unit properties relations members=""
@@ -2397,6 +2397,11 @@ _scope_start_transaction() {
     done <<< "${properties}"
     resolve_plasma_drm_device || return 1
     _require_kms_output_ready || return 1
+    local render
+    render="$(_selected_render_node_plain)" || return 1
+    [[ "${render}" =~ ^/dev/dri/renderD[0-9]+$ ]] || {
+        err "No render node belongs to the selected GPU."; return 1;
+    }
     role="$(_effective_gpu_role)"
     if _bool_true "${SUNSHINE_SUPERVISE}"; then
         _scope_sunshine_preflight "${role}" || return 1
@@ -2420,7 +2425,7 @@ _scope_start_transaction() {
         "${launcher}" --user --scope --unit="${scope}" \
         /usr/bin/env "PLASMACTL_RUN_ID=${run}" "XDG_SESSION_ID=${sid}" \
         "XDG_RUNTIME_DIR=${RUNTIME_DIR}" "DBUS_SESSION_BUS_ADDRESS=unix:path=${RUNTIME_DIR}/bus" \
-        "KWIN_DRM_DEVICES=${TARGET_DRM_DEVICE}" XDG_SESSION_TYPE=wayland \
+        "KWIN_DRM_DEVICES=${TARGET_DRM_DEVICE}" "KWIN_RENDER_NODES=${render}" XDG_SESSION_TYPE=wayland \
         XDG_CURRENT_DESKTOP=KDE KDE_FULL_SESSION=true "$(command -v startplasma-wayland)")" || return 1
     _scope_update --arg pane "${pane}" '.pane = $pane' || return 1
     while (( ticks < WAIT_PLASMA * 5 )); do

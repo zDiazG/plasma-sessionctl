@@ -124,16 +124,17 @@ expect_failure _scope_start
 [[ -e "${SCOPE_STATE_FILE}" && ! -s "${fixture_log}" ]] || fail 'failed start adopted an existing execution'
 
 # The manager environment parser preserves quoted/spaced values as data.
-fixture_manager_payload='{"type":"as","data":["DISPLAY=old display","SECRET_TOKEN=not-exported"]}'
+fixture_manager_payload='{"type":"as","data":["DISPLAY=old display","KWIN_RENDER_NODES=/dev/dri/renderD128","SECRET_TOKEN=not-exported"]}'
 env_json="$(_scope_manager_environment)"
-jq -e '.DISPLAY == "old display" and (has("SECRET_TOKEN")|not)' <<< "${env_json}" >/dev/null || fail 'environment filtering failed'
+jq -e '.DISPLAY == "old display" and .KWIN_RENDER_NODES == "/dev/dri/renderD128" and (has("SECRET_TOKEN")|not)' <<< "${env_json}" >/dev/null || fail 'environment filtering failed'
 
 fixture
-fixture_manager_payload='{"type":"as","data":["DISPLAY=owned","PLASMACTL_RUN_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}'
-_scope_update '.environment_before = {DISPLAY:"old display"} | .environment_after = {DISPLAY:"owned",PLASMACTL_RUN_ID:.run}'
+fixture_manager_payload='{"type":"as","data":["DISPLAY=owned","KWIN_RENDER_NODES=/dev/dri/renderD128","PLASMACTL_RUN_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}'
+_scope_update '.environment_before = {DISPLAY:"old display"} | .environment_after = {DISPLAY:"owned",KWIN_RENDER_NODES:"/dev/dri/renderD128",PLASMACTL_RUN_ID:.run}'
 _scope_restore_environment || fail 'environment restoration failed'
 grep -Fxq 'set-environment DISPLAY=old display' "${fixture_log}" || fail 'previous display was not restored'
 grep -Fxq 'unset-environment PLASMACTL_RUN_ID' "${fixture_log}" || fail 'run marker was not removed'
+grep -Fxq 'unset-environment KWIN_RENDER_NODES' "${fixture_log}" || fail 'render-node selection was not restored'
 
 _scope_unit missing.scope >/dev/null || fail 'collected scope was not treated as absence'
 expect_failure _scope_unit denied.scope
