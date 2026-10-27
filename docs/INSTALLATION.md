@@ -5,6 +5,14 @@ the integration before changing a host. Static validation and isolated tests do
 not establish a working stream. See [the lifecycle contract](../SPEC.md) for
 backend limits and [the README](../README.md) for commands.
 
+This guide assumes the required packages and the desktop/login environment
+already exist. There is no dependency installer or complete first-run wizard.
+The central Bash CLI remains `plasmactl`; its `setup --user` command generates
+user assets, while the Python installer below handles only the privileged
+Sunshine integration. Install Sunshine separately and use its supported initial
+credentials/pairing flow. Existing credentials and pairing state are not reset
+by the integration installer.
+
 ## Preparation
 
 Identify the desktop UID, existing seat0 TTY login, tmux session, installed native

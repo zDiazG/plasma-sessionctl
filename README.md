@@ -81,6 +81,39 @@ The old unrestricted sudoers example and `setup --system` installer are retired.
 Getty/PAM, tmux console setup, autologin and boot changes remain separate host
 operations.
 
+### What installation currently covers
+
+The central CLI is the Bash script `plasmactl`. It provides lifecycle commands,
+`status`, `doctor`, `session-check`, `sanity` and configuration/profile generation.
+It can be installed as an executable on your PATH; the managed Sunshine helper
+has its own fixed privileged installation path.
+
+To install only the user CLI from this checkout:
+
+```bash
+install -Dm755 plasmactl "$HOME/.local/bin/plasmactl"
+```
+
+Ensure `~/.local/bin` is on your PATH. This copies the controller; it does not
+install its dependencies or privileged integration.
+
+There is no `install.sh` or complete fresh-machine bootstrap yet. Install the
+requirements listed above through your distribution's supported packages first.
+Current setup tools assume Plasma, Sunshine, the existing seat0 login and tmux
+environment are already available:
+
+| Entry point | Current responsibility |
+| --- | --- |
+| `plasmactl setup --user` | Create a missing shell config and regenerate Sunshine profile/apps assets |
+| `tools/prepare-sunshine-integration.py` | Render the host-specific helper, policy, units and sudoers bundle |
+| `tools/install-sunshine-integration.py` | Install or restore reviewed integration files without activating services |
+| `plasmactl doctor` / `session-check` | Diagnose prerequisites and conflicts; do not install dependencies or repair the host |
+| `plasmactl status` | Inspect the selected backend; managed status checks owned units and Sunshine listeners |
+
+Sunshine installation, initial credentials/pairing and a complete dependency
+installer are not implemented by these commands. Some diagnostics still use
+legacy discovery; see [the diagnostic limits](#gpu-selection-and-evidence-limits).
+
 `setup --user`, `sunshine-safe` and `sunshine-profiles` regenerate profile assets;
 back up customized profiles and application lists before using them. Preservation
 of existing assets applies to scope startup, not all generation commands.
