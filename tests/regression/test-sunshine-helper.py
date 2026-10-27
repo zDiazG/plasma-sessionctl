@@ -29,6 +29,20 @@ prepare = load(ROOT / 'tools/prepare-sunshine-integration.py')
 
 
 class HelperArguments(unittest.TestCase):
+    def test_repeated_device_allow_properties_preserve_the_complete_policy(self):
+        text = ('LoadState=loaded\nUser=1234\nDevicePolicy=closed\n'
+                'FragmentPath=/etc/systemd/system/plasmactl-sunshine-u1234-igpu@.service\n'
+                'DropInPaths=\nDeviceAllow=/dev/uinput rw\n'
+                'DeviceAllow=/dev/dri/by-path/pci-0000:00:02.0-render rw\n'
+                'DeviceAllow=/dev/dri/by-path/pci-0000:00:02.0-card rw\n')
+        result = subprocess.CompletedProcess([], 0, stdout=text, stderr='')
+        with mock.patch.object(helper, 'command', return_value=result), mock.patch.object(helper, 'trusted'):
+            live = helper.unit_properties(helper.unit_name(1234, 'igpu', 'a' * 32))
+            helper.validate_unit(1234, {'gpus': {'igpu': '0000:00:02.0'}}, 'igpu', live)
+            live['DeviceAllow'] += ' /dev/dri/card9 rw'
+            with self.assertRaisesRegex(ValueError, 'device policy'):
+                helper.validate_unit(1234, {'gpus': {'igpu': '0000:00:02.0'}}, 'igpu', live)
+
     def test_rejects_injected_and_malformed_identity_arguments(self):
         bad = [
             ['start', 'a' * 32 + ';id', 'igpu', '1', 'wayland-0', 'safe'],

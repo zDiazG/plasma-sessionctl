@@ -43,7 +43,13 @@ def command(argv, check=True):
 
 def properties(argv):
     result = command(argv, check=False)
-    values = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+    values = {}
+    for line in result.stdout.splitlines():
+        if '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        # systemctl emits one DeviceAllow assignment for each device.
+        values[key] = values[key] + ' ' + value if key == 'DeviceAllow' and key in values else value
     require(result.returncode == 0 or values.get('LoadState') == 'not-found',
             result.stderr.strip() or 'Manager query failed')
     return values
