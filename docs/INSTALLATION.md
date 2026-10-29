@@ -5,13 +5,60 @@ the integration before changing a host. Static validation and isolated tests do
 not establish a working stream. See [the lifecycle contract](../SPEC.md) for
 backend limits and [the README](../README.md) for commands.
 
-This guide assumes the required packages and the desktop/login environment
-already exist. There is no dependency installer or complete first-run wizard.
-The central Bash CLI remains `plasmactl`; its `setup --user` command generates
-user assets, while the Python installer below handles only the privileged
-Sunshine integration. Install Sunshine separately and use its supported initial
-credentials/pairing flow. Existing credentials and pairing state are not reset
-by the integration installer.
+## User bootstrap
+
+Use a complete checkout with Bash, coreutils and Python 3.10+. Both entry points
+use the same implementation before sourcing any user configuration:
+
+```bash
+./install.sh plan
+./plasmactl bootstrap install --dry-run --install-deps
+./install.sh install --install-deps
+```
+
+Plan output is JSON and includes missing packages, repository availability,
+CLI/configuration paths and read-only environment observations. A successful
+plan command means the report was generated, not that the host is ready. It
+never refreshes package databases or creates user directories. `--dry-run`
+applies to bootstrap install/configure; the explicit integration wrapper retains
+the existing tools' interfaces and has no implicit dry-run mode.
+
+Automatic dependencies support Arch/CachyOS using existing pacman repositories.
+All required missing package names must be queryable before installation. If
+Sunshine is unavailable, arrange a supported package source manually and retry.
+No AUR helper or repository is added. Pacman installation requires explicit
+`--install-deps`; `--yes` additionally opts out of package prompts. No standalone
+`-Sy` or automatic whole-system upgrade is performed. Package transactions can
+have package-manager side effects and are not rolled back by the user installer.
+On other distributions, install prerequisites manually, then use
+`./install.sh install --skip-dependencies`.
+
+Installation is per-user and refuses to run as root. `--prefix` must be inside
+HOME and its existing directory components must be owned by that user, without
+symlinks or group/other write access. The installed CLI points into
+`PREFIX/share/plasmactl/versions/CONTENT_HASH`, containing its required resources.
+Do not replace that symlink with a copy of only the Bash file if you need bootstrap.
+
+An existing different CLI requires `--replace-cli`. Its previous file bytes/mode
+or symlink target are recorded under `PREFIX/share/plasmactl/receipts/`. Existing
+version payloads are verified before reuse. Installation does not replace any
+existing user configuration, profile, application list, credential or pairing
+file. New managed profiles require WAN encryption. New shell config selects
+systemd-scope, performance and igpu without fallback. No JSON overlay is created;
+existing overlays remain authoritative and must be reviewed.
+
+`plasmactl bootstrap configure` performs only missing-file initialization.
+`--no-configure` limits install to the user CLI/resources. If configuration
+publication fails after the CLI has been published, the command fails and points
+to its recovery receipt. It preserves the installed CLI; it does not claim that
+the entire operation rolled back. Receipts retain previous CLI data for manual
+recovery, while automatic user-CLI uninstall/rollback is not implemented yet.
+
+This bootstrap does not prepare getty/PAM, autologin, tmux login attachment,
+boot/EDID, pairing or service activation. Inspect the following prerequisites
+before using the managed runtime. Initialize Sunshine credentials/pairing through
+its supported Web UI flow once the reviewed service is running; existing
+credentials are never reset by bootstrap.
 
 ## Preparation
 
@@ -29,7 +76,7 @@ Use a new private output directory. Omit a GPU role if it is not supported by th
 target host:
 
 ```bash
-python3 tools/prepare-sunshine-integration.py --uid "$(id -u)" --tty tty2 \
+plasmactl bootstrap integration prepare --uid "$(id -u)" --tty tty2 \
   --igpu '<IGPU_PCI_ADDRESS>' --dgpu '<DGPU_PCI_ADDRESS>' \
   --output /tmp/plasmactl-integration
 ```
@@ -58,7 +105,7 @@ backup directory for each attempt:
 
 ```bash
 sudo install -d -m 0700 /var/lib/plasmactl
-sudo python3 -I tools/install-sunshine-integration.py install \
+sudo "$HOME/.local/bin/plasmactl" bootstrap integration install \
   /tmp/plasmactl-integration /var/lib/plasmactl/before-sunshine-integration
 ```
 
@@ -157,7 +204,7 @@ quiescent during installation or rollback.
 After stopping the owned execution, rollback can use:
 
 ```bash
-sudo python3 -I tools/install-sunshine-integration.py rollback \
+sudo "$HOME/.local/bin/plasmactl" bootstrap integration rollback \
   /var/lib/plasmactl/before-sunshine-integration
 ```
 
@@ -170,10 +217,11 @@ was previously enabled but inactive.
 
 ## Local checks
 
-For an affected installer/helper change, run the Python regression file without
-root or GPU access:
+For the affected bootstrap or privileged installer/helper, run the corresponding
+Python regression file without root or GPU access:
 
 ```bash
+python3 -I tests/regression/test-bootstrap.py
 python3 -I tests/regression/test-sunshine-helper.py
 ```
 
@@ -192,3 +240,8 @@ Linux `/proc` and `jq` are needed for the relevant checks. They do not run the
 real host installer, Plasma or Sunshine. Run only affected cases after a focused
 correction. Native candidate validation and real lifecycle/capture tests provide
 separate evidence; neither is implied by these regression results.
+
+Bootstrap tests install real user payloads into temporary HOME directories and
+simulate package queries/transactions. They do not install real system packages.
+A clean-machine package installation and first-run client workflow remain
+separate acceptance evidence.

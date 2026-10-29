@@ -61,6 +61,37 @@ use mandatory WAN encryption; existing configuration retains its settings.
 `performance` uses `plasmactl-performance.conf` under `~/.config/sunshine`.
 Managed mode rejects custom Sunshine arguments and configuration paths.
 
+## Bootstrap interface
+
+`install.sh` and the first-position `plasmactl bootstrap` command enter the same
+Python 3.10+ standard-library tool. Lifecycle remains Bash; the existing root
+helper/installers remain Python. Bootstrap dispatch happens before user config,
+user-context discovery and directory initialization. A malformed or executable
+user shell/JSON config cannot block or execute through bootstrap plan.
+
+- `plan`, the default action, emits a read-only JSON report.
+- `install --dry-run` and `configure --dry-run` emit that report without mutation.
+- `install` publishes a self-contained content-versioned user CLI and initializes
+  absent configuration. It refuses existing CLI replacement without explicit
+  `--replace-cli`, preserving previous data in a private receipt.
+- `configure` creates absent assets without replacing operator files.
+- `integration prepare|install|rollback` forwards arguments to the existing
+  reviewed tools, without implicit privilege escalation or service activation.
+
+Package installation requires explicit `--install-deps`, supports existing
+Arch/CachyOS pacman repositories and rejects unavailable packages. Database-only
+refresh, implicit full upgrades, AUR helpers and repository creation are excluded.
+`--skip-dependencies` is an explicit manual-dependency path for other environments.
+No credentials are accepted as arguments, generated, reset or printed. Bootstrap
+reporting is not full runtime health: `session-check`, selected-unit status and
+actual streaming acceptance remain separate checks.
+
+Only absent bootstrap assets use secure new defaults. Existing overlays and
+profiles retain their behavior. User installation is atomic per published file,
+not one atomic package/configuration transaction. Package-manager effects are
+not rolled back; partial configuration failure retains the published CLI and its
+recovery receipt. Automatic user-CLI rollback/uninstall remain follow-up work.
+
 ## Identity, start and recovery
 
 The private `~/.local/state/plasmactl/scope-session.json` records schema, UID,
