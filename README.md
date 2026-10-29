@@ -342,6 +342,4 @@ If `jq` is available, `plasmactl` can load configuration options from `~/.config
 
 ## License
 
-Source headers declare GNU General Public License v3.0 or later. A standalone
-LICENSE file is not included in this checkout; distributing the license text
-remains a packaging task.
+Licensed under GNU General Public License v3.0 or later. See [LICENSE](LICENSE).

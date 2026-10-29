@@ -27,7 +27,7 @@ PAYLOAD = ('plasmactl', 'install.sh', 'tools/bootstrap.py',
            'libexec/plasmactl-sunshine', 'config/systemd/plasmactl-sunshine.service.in',
            'sunshine/plasmactl-safe.conf', 'sunshine/plasmactl-performance.conf',
            'sunshine/plasmactl-apps-safe.json', 'sunshine/plasmactl-apps-performance.json',
-           'README.md', 'SPEC.md', 'docs/INSTALLATION.md')
+           'README.md', 'SPEC.md', 'LICENSE', 'CHANGELOG.md', 'docs/INSTALLATION.md')
 EXECUTABLES = {'plasmactl', 'install.sh', 'libexec/plasmactl-sunshine'}
 
 
