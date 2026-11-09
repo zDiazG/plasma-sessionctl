@@ -2238,6 +2238,7 @@ _scope_capture_graph() {
     units="$(_scope_graph_units)" || return 1
     while read -r unit; do
         [[ -n "${unit}" ]] || continue
+        jq -e --arg u "${unit}" '(.baseline_active|index($u)) != null' "${SCOPE_STATE_FILE}" >/dev/null && continue
         _scope_capture_unit "${unit}" "${run}" true || return 1
     done <<< "${units}"
 }
@@ -2335,6 +2336,7 @@ _scope_stop() {
         properties="$(_scope_unit "${unit}")" || return 1
         case "$(_scope_property "${properties}" ActiveState)" in inactive|failed) continue ;; esac
         known="$(jq -r --arg u "${unit}" '.units[$u] // empty' "${SCOPE_STATE_FILE}")" || return 1
+        if [[ -z "${known}" ]] && jq -e --arg u "${unit}" '(.baseline_active|index($u)) != null' "${SCOPE_STATE_FILE}" >/dev/null; then continue; fi
         [[ -n "${known}" ]] || { err "Unrecorded active desktop dependency ${unit}; refusing stop."; return 1; }
         _scope_match_unit "${unit}" "${known}" || return 1
     done <<< "${graph}"
@@ -2419,14 +2421,26 @@ _scope_start_transaction() {
     sid="$(get_tty_session_id)"
     _scope_validate_login "${sid}" || { err "Login identity does not match user/seat/TTY."; return 1; }
     check_tmux_session || { err "Configured tmux session is unavailable."; return 1; }
-    # Reject already-running dependents, even if the desktop target is inactive.
+    # Snapshot active units before checking the desktop graph. Shared helpers
+    # such as xdg-desktop-portal can outlive graphical-session.target and must
+    # not be mistaken for a desktop that this run could adopt.
+    baseline="$(_scope_systemctl list-units --all --output=json --no-pager |
+        jq -ce '[.[] | select(.active != "inactive" and .active != "failed") | .unit]')" || return 1
+    # Reject active desktop dependencies unless they were already active in
+    # that baseline. Only the known owned Plasma core units are always fatal.
     properties="$(_scope_graph_units)" || return 1
     while read -r unit; do
         [[ -n "${unit}" ]] || continue
         before="$(_scope_unit "${unit}")" || return 1
         case "$(_scope_property "${before}" ActiveState)" in
             inactive) ;;
-            *) err "Desktop dependency ${unit} is not inactive; refusing adoption."; return 1 ;;
+            active|activating|reloading)
+                if [[ "${unit}" != *.service || "${unit}" == plasma-*.service ]] ||
+                    ! jq -e --arg u "${unit}" --argjson baseline "${baseline}" '($baseline|index($u)) != null' <<< '{}'; then
+                    err "Desktop dependency ${unit} is already active outside this execution; refusing adoption."
+                    return 1
+                fi ;;
+            *) err "Desktop dependency ${unit} is changing state; refusing adoption."; return 1 ;;
         esac
     done <<< "${properties}"
     resolve_plasma_drm_device || return 1
@@ -2442,8 +2456,6 @@ _scope_start_transaction() {
         _scope_prepare_sunshine_config || return 1
     fi
     before="$(_scope_manager_environment)" || return 1
-    baseline="$(_scope_systemctl list-units --all --output=json --no-pager |
-        jq -ce '[.[] | select(.active != "inactive" and .active != "failed") | .unit]')" || return 1
     run="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
     scope="plasmactl-plasma-${run}.scope"
     # Create without overwriting an existing state record, including symlinks.

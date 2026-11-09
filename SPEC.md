@@ -189,3 +189,7 @@ Legacy `confirm-gpu`/`gpu-assert` diagnostics do not use the managed Sunshine
 manifest. Missing journals/descriptors are inconclusive. Runtime acceptance must
 observe the selected service identity, device policy, actual video/encoder/input
 and recovery. See [installation and recovery](docs/INSTALLATION.md).
+
+Pre-existing auxiliary services in the pre-launch active baseline are excluded
+from adoption and explicit stop requests. Active Plasma services and desktop
+targets still prevent startup. Stopping a target can affect its PartOf services.
