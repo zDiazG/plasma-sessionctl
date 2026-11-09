@@ -257,3 +257,9 @@ It still waits for the login to become active before launching Plasma.
 If both paths fail, check the integration's exact configured TTY grant. Do not
 grant unrestricted `loginctl` or `chvt`. Doctor prerequisite success does not
 prove that an inactive login can be activated from SSH.
+
+The restricted activation fallback was exercised on one host after reboot
+recovery. Start, stop, and restart completed from SSH; Plasma and managed
+Sunshine were active on the selected integrated GPU afterward. This confirms
+that workflow on that host. It does not identify why the earlier boot stalled
+or establish recovery for every interrupted boot.
