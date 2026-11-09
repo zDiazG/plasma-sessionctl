@@ -104,6 +104,10 @@ unit. Duplicate start is a refusal, not idempotent success. Known native Sunshin
 graphical-session autostart must be disabled or explicitly masked before start;
 custom autostarts still require operator review.
 
+Pre-existing auxiliary services in the pre-launch active baseline are excluded
+from adoption and explicit stop requests. Active Plasma services and desktop
+targets still prevent startup. Stopping a target can affect its PartOf services.
+
 The launcher receives a fresh tmux pane and a scope named
 `plasmactl-plasma-<run>.scope`. KWin/plasmashell require exact run/login/GPU
 process markers. Other desktop graph members require explicit membership and
@@ -121,7 +125,9 @@ Stop validates the recorded desktop set, stops the recorded Sunshine first,
 then stops the desktop units with a bounded wait. Changed invocations, unknown
 desktop dependents and denied queries retain state for inspection. Native
 service restart recovery is not automatic. Restart starts a fresh execution
-only after stop succeeds and preserves backend/GPU/Plasma-only intent.
+only after stop succeeds and preserves backend/GPU/Plasma-only intent. With no
+record, stop succeeds without runtime actions, so restart proceeds to start.
+Status reports the absence of a managed record and returns nonzero.
 
 A structurally valid record owned by the current UID but carrying a different
 boot ID is stale. Status reports it without querying current units. Stop removes
@@ -189,7 +195,3 @@ Legacy `confirm-gpu`/`gpu-assert` diagnostics do not use the managed Sunshine
 manifest. Missing journals/descriptors are inconclusive. Runtime acceptance must
 observe the selected service identity, device policy, actual video/encoder/input
 and recovery. See [installation and recovery](docs/INSTALLATION.md).
-
-Pre-existing auxiliary services in the pre-launch active baseline are excluded
-from adoption and explicit stop requests. Active Plasma services and desktop
-targets still prevent startup. Stopping a target can affect its PartOf services.

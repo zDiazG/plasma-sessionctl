@@ -79,6 +79,18 @@ mv "${SCOPE_STATE_FILE}.new" "${SCOPE_STATE_FILE}"
 expect_failure _scope_stop
 [[ -e "${SCOPE_STATE_FILE}" ]] || fail 'foreign-UID state was removed'
 
+# Missing state is an idempotent stop, allowing restart to reach start.
+rm -- "${SCOPE_STATE_FILE}"
+_scope_stop || fail 'stop without a record must succeed'
+[[ ! -s "${fixture_log}" ]] || fail 'empty stop touched manager units'
+expect_failure _scope_status
+
+# A stale boot cannot bypass validation of the rest of the record.
+fixture
+_scope_update '.boot = "old-boot" | .units = "malformed"'
+expect_failure _scope_stop
+[[ -f "${SCOPE_STATE_FILE}" ]] || fail 'malformed stale record was removed'
+
 fixture
 jq --arg u "${fixture_scope}" '.[$u].inv = "11111111111111111111111111111111"' "${fixture_db}" > "${fixture_db}.new"
 mv "${fixture_db}.new" "${fixture_db}"

@@ -2112,8 +2112,10 @@ _scope_update() {
 _scope_load() {
     command -v jq >/dev/null || { err "The scope backend requires jq."; return 1; }
     [[ -f "${SCOPE_STATE_FILE}" && ! -L "${SCOPE_STATE_FILE}" ]] || return 1
-    jq -e --arg uid "${REAL_UID}" --arg boot "$(_scope_boot_id)" '
-        .schema == 1 and (.uid|tostring) == $uid and .boot == $boot
+    jq -e --arg uid "${REAL_UID}" --arg boot "$(_scope_boot_id)" --arg mode "${1:-current}" '
+        .schema == 1 and (.uid|tostring) == $uid
+        and (.boot|type == "string" and length > 0)
+        and (.boot == $boot or $mode == "allow-stale")
         and (.run|type == "string" and test("^[a-f0-9]{32}$"))
         and .scope == ("plasmactl-plasma-" + .run + ".scope")
         and (.sid|type == "string" and test("^[a-zA-Z0-9_-]+$"))
@@ -2137,13 +2139,9 @@ _scope_load() {
     }
 }
 _scope_stale_boot() {
-    [[ -f "${SCOPE_STATE_FILE}" && ! -L "${SCOPE_STATE_FILE}" ]] || return 1
-    jq -e --arg uid "${REAL_UID}" --arg boot "$(_scope_boot_id)" '
-        .schema == 1 and (.uid|tostring) == $uid and (.boot|type == "string")
-        and .boot != $boot
-        and (.run|type == "string" and test("^[a-f0-9]{32}$"))
-        and .scope == ("plasmactl-plasma-" + .run + ".scope")
-    ' "${SCOPE_STATE_FILE}" >/dev/null
+    # Apply the complete schema and UID checks before accepting stale state.
+    _scope_load allow-stale 2>/dev/null || return 1
+    jq -e --arg boot "$(_scope_boot_id)" '.boot != $boot' "${SCOPE_STATE_FILE}" >/dev/null
 }
 _scope_manager_environment() {
     _run_as_user busctl --user --json=short get-property \
@@ -2274,6 +2272,10 @@ _scope_restore_environment() {
     done < <(jq -r --argjson before "${before}" '(. + $before)|keys[]' <<< "${after}")
 }
 _scope_status() {
+    if [[ ! -e "${SCOPE_STATE_FILE}" && ! -L "${SCOPE_STATE_FILE}" ]]; then
+        printf 'No managed execution is recorded.\n'
+        return 1
+    fi
     if _scope_stale_boot; then
         err "Scope record belongs to a previous boot; no current units were inspected. Run stop to clear the stale record before starting again."
         return 1
@@ -2300,6 +2302,10 @@ _scope_status() {
     return "${status}"
 }
 _scope_stop() {
+    if [[ ! -e "${SCOPE_STATE_FILE}" && ! -L "${SCOPE_STATE_FILE}" ]]; then
+        log "No managed execution is recorded; nothing to stop."
+        return 0
+    fi
     if _scope_stale_boot; then
         rm -- "${SCOPE_STATE_FILE}" || return 1
         log "Removed validated scope record from a previous boot; no units or processes were signalled."
@@ -2436,7 +2442,7 @@ _scope_start_transaction() {
             inactive) ;;
             active|activating|reloading)
                 if [[ "${unit}" != *.service || "${unit}" == plasma-*.service ]] ||
-                    ! jq -e --arg u "${unit}" --argjson baseline "${baseline}" '($baseline|index($u)) != null' <<< '{}'; then
+                    ! jq -e --arg u "${unit}" --argjson baseline "${baseline}" '($baseline|index($u)) != null' <<< '{}' >/dev/null; then
                     err "Desktop dependency ${unit} is already active outside this execution; refusing adoption."
                     return 1
                 fi ;;
