@@ -189,6 +189,11 @@ Stop refuses changed invocations. It can refresh late desktop dependents only
 while the recorded scope and both core process identities still match. An existing state
 record routes stop/status through this backend even if the default configuration
 is later changed; legacy start and cleanup cannot discard it.
+After reboot, status reports a validated prior-boot record. Stop removes only
+that record without contacting systemd or signalling processes, after which a
+new managed start can proceed. Without a record, stop succeeds without runtime
+actions so restart can continue to start. Malformed or foreign-UID records remain
+for review; a failed stop prevents restart from starting a new execution.
 
 Plasma and managed Sunshine start/status/restart/stop have been exercised on one
 Intel/Plasma setup. A device-open probe confirmed that Sunshine's cgroup permits
