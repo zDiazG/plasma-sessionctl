@@ -2383,8 +2383,9 @@ _scope_activate_login() {
     local sid="$1"
     [[ "$(get_session_active_state "${sid}")" == yes ]] && return 0
     _bool_true "${ACTIVATE_TTY_ON_START}" || { err "The scope backend requires its login to be active."; return 1; }
-    "${LOGINCTL_BIN}" --no-ask-password activate "${sid}" || {
-        err "Cannot activate the login non-interactively; no scope has been launched."
+    "${LOGINCTL_BIN}" --no-ask-password activate "${sid}" ||
+        { _scope_validate_login "${sid}" && _sudo "${CHVT_BIN}" "${TTY_NAME#tty}"; } || {
+        err "Cannot activate the login; verify the restricted chvt grant for the configured TTY. No scope has been launched."
         return 1
     }
     local ticks=0
