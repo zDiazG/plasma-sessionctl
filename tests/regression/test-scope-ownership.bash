@@ -63,10 +63,21 @@ fixture
 _scope_load || fail 'valid state rejected'
 _scope_status >/dev/null || fail 'valid running state rejected'
 
-# State from another boot must never authorize a manager operation.
+# A validated state record from an earlier boot is safely cleared without
+# querying or signalling current units.
 _scope_update '.boot = "old-boot"'
+_scope_stale_boot || fail 'valid stale-boot state was not recognized'
+_scope_stop || fail 'stale-boot record was not cleared'
+[[ ! -e "${SCOPE_STATE_FILE}" ]] || fail 'stale state record remains'
+[[ ! -s "${fixture_log}" ]] || fail 'stale boot caused manager operations'
+
+# A record for another UID is never considered recoverable.
+fixture
+jq '.uid = "99999" | .boot = "old-boot"' "${SCOPE_STATE_FILE}" > "${SCOPE_STATE_FILE}.new"
+mv "${SCOPE_STATE_FILE}.new" "${SCOPE_STATE_FILE}"
+! _scope_stale_boot || fail 'foreign-UID state was classified stale'
 expect_failure _scope_stop
-[[ ! -s "${fixture_log}" ]] || fail 'old boot caused mutation'
+[[ -e "${SCOPE_STATE_FILE}" ]] || fail 'foreign-UID state was removed'
 
 fixture
 jq --arg u "${fixture_scope}" '.[$u].inv = "11111111111111111111111111111111"' "${fixture_db}" > "${fixture_db}.new"

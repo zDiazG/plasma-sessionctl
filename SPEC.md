@@ -123,6 +123,12 @@ desktop dependents and denied queries retain state for inspection. Native
 service restart recovery is not automatic. Restart starts a fresh execution
 only after stop succeeds and preserves backend/GPU/Plasma-only intent.
 
+A structurally valid record owned by the current UID but carrying a different
+boot ID is stale. Status reports it without querying current units. Stop removes
+only that state file and does not signal units, processes, Sunshine, or restore
+the previous boot's user-manager environment. Malformed and foreign-UID records
+remain untouched for manual review.
+
 Failed start attempts clean up only their own identified execution and preserve
 the original failure status. Cleanup can remain partial when ownership cannot
 be proved. Tracked user-manager environment values are restored only if their

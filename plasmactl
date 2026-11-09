@@ -2136,6 +2136,15 @@ _scope_load() {
         return 1
     }
 }
+_scope_stale_boot() {
+    [[ -f "${SCOPE_STATE_FILE}" && ! -L "${SCOPE_STATE_FILE}" ]] || return 1
+    jq -e --arg uid "${REAL_UID}" --arg boot "$(_scope_boot_id)" '
+        .schema == 1 and (.uid|tostring) == $uid and (.boot|type == "string")
+        and .boot != $boot
+        and (.run|type == "string" and test("^[a-f0-9]{32}$"))
+        and .scope == ("plasmactl-plasma-" + .run + ".scope")
+    ' "${SCOPE_STATE_FILE}" >/dev/null
+}
 _scope_manager_environment() {
     _run_as_user busctl --user --json=short get-property \
         org.freedesktop.systemd1 /org/freedesktop/systemd1 \
@@ -2264,6 +2273,10 @@ _scope_restore_environment() {
     done < <(jq -r --argjson before "${before}" '(. + $before)|keys[]' <<< "${after}")
 }
 _scope_status() {
+    if _scope_stale_boot; then
+        err "Scope record belongs to a previous boot; no current units were inspected. Run stop to clear the stale record before starting again."
+        return 1
+    fi
     _scope_load || return 1
     local unit invocation properties status=0
     while IFS=$'\t' read -r unit invocation; do
@@ -2286,6 +2299,11 @@ _scope_status() {
     return "${status}"
 }
 _scope_stop() {
+    if _scope_stale_boot; then
+        rm -- "${SCOPE_STATE_FILE}" || return 1
+        log "Removed validated scope record from a previous boot; no units or processes were signalled."
+        return 0
+    fi
     _scope_load || return 1
     local run scope unit invocation properties units remaining ticks=0
     run="$(jq -r '.run' "${SCOPE_STATE_FILE}")"
