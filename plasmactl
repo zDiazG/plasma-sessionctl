@@ -3,7 +3,7 @@
 # plasmactl — KDE Plasma Wayland + Sunshine session controller
 # Architecture: getty@tty2 → autologin → tmux plasma → startplasma-wayland → Sunshine
 # License: GPL-3.0-or-later
-# Version: 0.4.3
+# Version: 0.5.1
 #
 # Copyright (C) 2026 plasmactl contributors
 #
@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-VERSION="0.5.0"
+VERSION="0.5.1"
 VERBOSE=false
 FIX_MODE=false
 PLASMA_ONLY=false
