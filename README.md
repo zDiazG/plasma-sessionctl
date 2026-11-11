@@ -2,7 +2,7 @@
 
 Bash controller for KDE Plasma Wayland sessions and Sunshine streaming, with selectable GPU roles.
 
-Development candidate. The legacy backend remains the default. The managed backend has runtime evidence on one Intel setup; other deployments need their own acceptance checks.
+Current release: [v0.5.1](https://github.com/zDiazG/plasma-sessionctl/releases/tag/v0.5.1). New bootstrap configurations select the managed backend; existing legacy configurations remain supported. Managed Plasma and Sunshine streaming have operator acceptance on one Intel iGPU setup; other deployments need their own acceptance checks.
 
 ![Shell](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Linux-informational)
