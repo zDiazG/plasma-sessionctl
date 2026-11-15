@@ -13,10 +13,14 @@ import sys
 POLICY = Path('/etc/plasmactl/sunshine.json')
 RUNTIME = Path('/run/plasmactl')
 RUN_RE = re.compile(r'[a-f0-9]{32}')
+# An extra display stream appends -s<N> to its desktop run ID. The suffix selects
+# the fixed display profile and keeps the primary unit name unchanged.
+INSTANCE_RE = re.compile(r'([a-f0-9]{32})(?:-s([1-3]))?')
 PCI_RE = re.compile(r'[a-f0-9]{4}:[a-f0-9]{2}:[a-f0-9]{2}\.[0-7]')
 ROLES = ('igpu', 'dgpu')
 PROFILES = {'normal': 'sunshine.conf', 'safe': 'plasmactl-safe.conf',
             'performance': 'plasmactl-performance.conf'}
+DISPLAY_PROFILES = {f'display{n}': f'plasmactl-display{n}.conf' for n in (1, 2, 3)}
 ENV = {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C'}
 
 
@@ -136,7 +140,7 @@ def validate_args(args):
     require(len(args) >= 3, 'Expected ACTION RUN ROLE [arguments]')
     action, run, role, *extra = args
     require(action in ('check', 'start', 'stop', 'status'), 'Invalid action')
-    require(RUN_RE.fullmatch(run) is not None and role in ROLES, 'Invalid run or GPU role')
+    require(INSTANCE_RE.fullmatch(run) is not None and role in ROLES, 'Invalid run or GPU role')
     require(len(extra) == {'check': 0, 'status': 0, 'stop': 1, 'start': 3}[action],
             'Unexpected arguments')
     if action == 'stop':
@@ -145,7 +149,13 @@ def validate_args(args):
         sid, display, profile = extra
         require(re.fullmatch(r'[a-zA-Z0-9_-]+', sid) is not None, 'Invalid login ID')
         require(re.fullmatch(r'wayland-[0-9]+', display) is not None, 'Invalid Wayland display')
-        require(profile in PROFILES, 'Invalid Sunshine profile')
+        stream = INSTANCE_RE.fullmatch(run)[2]
+        # A display stream may only use its own fixed profile, and the primary
+        # unit may not use a display profile.
+        if stream:
+            require(profile == f'display{stream}', 'Display stream requires its own profile')
+        else:
+            require(profile in PROFILES, 'Invalid Sunshine profile')
     return action, run, role, extra
 
 
@@ -180,14 +190,14 @@ def session_environment(uid, account, policy, run, role, extra):
     info = socket.stat()
     require(stat.S_ISSOCK(info.st_mode) and info.st_uid == uid and not socket.is_symlink(),
             'Wayland socket does not belong to the caller')
-    config = Path(account.pw_dir) / '.config/sunshine' / PROFILES[profile]
+    config = Path(account.pw_dir) / '.config/sunshine' / {**PROFILES, **DISPLAY_PROFILES}[profile]
     validate_config(config, Path(account.pw_dir), uid)
     card, render = devices(policy, role)
     values = {'HOME': account.pw_dir, 'XDG_RUNTIME_DIR': str(runtime),
               'WAYLAND_DISPLAY': display, 'XDG_SESSION_ID': sid,
               'XDG_SESSION_TYPE': 'wayland', 'XDG_CURRENT_DESKTOP': 'KDE',
               'DBUS_SESSION_BUS_ADDRESS': f'unix:path={runtime}/bus',
-              'KWIN_DRM_DEVICES': card, 'PLASMACTL_RUN_ID': run,
+              'KWIN_DRM_DEVICES': card, 'PLASMACTL_RUN_ID': INSTANCE_RE.fullmatch(run)[1],
               'PLASMACTL_SUNSHINE_CONFIG': str(config)}
     return values, card, render
 
@@ -206,6 +216,13 @@ def operate(uid, account, policy, action, run, role, extra):
         return {'unit': unit, 'card': card, 'render': render}
     if action == 'start':
         require(not active and not record.exists(), 'Run already exists; refusing adoption')
+        if INSTANCE_RE.fullmatch(run)[2]:
+            # A display stream needs the desktop run's own managed Sunshine.
+            base = INSTANCE_RE.fullmatch(run)[1]
+            primary = unit_properties(unit_name(uid, role, base))
+            require(primary.get('ActiveState') == 'active' and primary.get('User') == str(uid)
+                    and (RUNTIME / f'{uid}-{role}-{base}.env').is_file(),
+                    'The desktop run has no active managed Sunshine; refusing display stream')
         values, _, _ = session_environment(uid, account, policy, run, role, extra)
         # A root-owned run record is created before activation. Failed starts retain
         # it so a later controller can inspect and stop this exact run.

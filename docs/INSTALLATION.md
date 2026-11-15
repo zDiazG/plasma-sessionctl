@@ -215,6 +215,25 @@ previous states and verify each. Re-enable the package user service only if it
 was enabled before migration. Do not start it automatically merely because it
 was previously enabled but inactive.
 
+## Extra displays
+
+Extra display streams need the helper from this release. Run the preparation and
+inactive installation again after updating the controller, because the helper
+is replaced as one reviewed file. The unit templates and sudoers are unchanged
+in content. Also install `krfb` (for `krfb-virtualmonitor`) and `kscreen-doctor`
+(part of KScreen). After a restart of the managed execution, check:
+
+```bash
+plasmactl display add
+plasmactl display list
+plasmactl display firewall
+```
+
+`display add` refuses to continue unless the primary Sunshine is ready, the
+slot's ports are free and KWin reports the new output. Apply the printed firewall
+rules yourself, then add `<host>:<port>` in Moonlight, pair through the Sunshine
+web UI of that slot, and connect from a second Moonlight window.
+
 ## Network ports
 
 Sunshine derives its ports from the configured `port` (default 47989). Offsets
@@ -230,6 +249,8 @@ come from upstream source, so confirm them against the installed version.
 | Control | UDP | `port + 10` (47999) |
 | Audio | UDP | `port + 11` (48000) |
 
+Each extra display stream uses its own block at `DISPLAY_PORT_BASE + 1000 * slot`.
+`plasmactl display firewall` prints the exact rules for the recorded slots.
 `plasmactl` does not change the host firewall. With a default-drop firewall such
 as UFW, allow these ports from the client network only. A listening socket that
 answers `curl` on the host is not reachable until the firewall allows it. A

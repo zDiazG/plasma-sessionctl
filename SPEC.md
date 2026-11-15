@@ -29,13 +29,11 @@ UID's managed policy and checks all managed Sunshine services for activity.
 | TTY return/console lock/logout settings | Existing legacy behavior | Not implemented |
 | Automatic fallback on helper failure | Not applicable | None |
 
-Multi-display streaming is not implemented. One Sunshine instance captures one
-output and runs one app at a time, so a second Moonlight window on another
-output needs a second Sunshine instance with its own state, pairing and port
-block. The managed unit name carries one run and role, so a second instance is
-outside the ownership model: `stop` does not signal it, and it has no device
-allowlist unless it is started through a reviewed helper extension. Virtual
-outputs created by other tools are likewise unmanaged.
+One Sunshine instance captures one output and serves one app at a time. Extra
+display streams therefore use one additional managed instance per output (see
+"Extra display streams"). Sunshine instances or virtual outputs started by
+other means remain unmanaged: `stop` does not signal them and they have no
+device allowlist.
 
 The retired `setup --system` command returns failure before its former getty,
 shell-profile and sudoers mutations. `setup --user` remains a profile-generation
@@ -188,6 +186,44 @@ as the desktop UID with `DevicePolicy=closed` and explicit card/render/uinput
 access. There are no added ambient capabilities; required packaged binary
 capabilities must already exist. This restricts the service cgroup, not every
 process owned by the user. Automatic Sunshine restart is initially disabled.
+
+## Extra display streams
+
+`plasmactl display add|remove|list|firewall` exists only for the scope backend
+with managed Sunshine. Slots 1 to 3 are allowed. Each slot owns:
+
+- a transient user unit `plasmactl-display-<run>-<slot>.service` running
+  `krfb-virtualmonitor --name plasmactl-d<slot>`, which creates the KWin output
+  `Virtual-plasmactl-d<slot>`. The output exists only while that unit runs;
+- a managed Sunshine system unit using the existing template with instance
+  `<run>-s<slot>`, the fixed profile `display<slot>` (file
+  `plasmactl-display<slot>.conf`) and its own state, credentials and ports;
+- a `displays` entry in `scope-session.json` with both unit invocations, port and
+  resolution. The record is written before any resource is created, so a failed
+  add rolls back only what it recorded.
+
+The helper accepts the `-s<slot>` suffix on the run argument and requires the
+matching profile. It starts a stream only while the same run's primary Sunshine is
+active and recorded, and keeps `DevicePolicy=closed` with the same allowlist.
+Validation, naming, record files and stop identity checks are unchanged.
+
+Ports derive from `DISPLAY_PORT_BASE + 1000 * slot`: TCP base-5, base, base+1 and
+base+21; UDP base+9, base+10 and base+11. Add refuses a slot whose ports already
+listen. The generated profile enables LAN encryption mode 1, WAN mode 2, no
+controller and no audio. It is published only when absent.
+
+Stop and failed-add rollback stop a stream's Sunshine by recorded invocation
+first, then its output unit, and refuse when either invocation changed. Session
+stop removes all extra displays before the primary Sunshine. State from a
+previous boot is cleared without signalling units. Restart does not recreate
+extra displays. `plasmactl` never changes the firewall; `display firewall` prints
+the rules. Audio is not provided on extra streams: Sunshine instances share the
+user's `sink-sunshine-*` devices and default-sink switching, so per-stream audio
+needs separate evidence. Runtime evidence covers one Intel iGPU host: add, remove,
+restart and re-add, pairing that survives re-adding a slot, and two simultaneous
+1080p60 streams. Frame rate, latency, input mapping on the extra output, per-stream
+audio and the dGPU role are unverified. A controller older than this release does not know the
+`displays` field and will not stop extra displays.
 
 ## Exit status and evidence
 

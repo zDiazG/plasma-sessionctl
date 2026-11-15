@@ -3,7 +3,8 @@
 ## Unreleased
 
 - Document the Sunshine port map and the firewall requirement for non-default ports.
-- Document that multi-display streaming is not implemented and what a second Sunshine instance does not inherit.
+- Add `plasmactl display add|remove|list|firewall` for optional extra Moonlight displays on the scope backend: a virtual KWin output plus its own managed Sunshine instance per slot.
+- Extend the restricted Sunshine helper with display stream instances (`<run>-s<slot>`) and fixed `display<slot>` profiles. Reinstall the integration to use them.
 
 ## 0.5.1
 
