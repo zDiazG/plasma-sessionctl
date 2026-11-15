@@ -3,7 +3,7 @@
 # plasmactl — KDE Plasma Wayland + Sunshine session controller
 # Architecture: getty@tty2 → autologin → tmux plasma → startplasma-wayland → Sunshine
 # License: GPL-3.0-or-later
-# Version: 0.5.1
+# Version: 0.6.0-dev
 #
 # Copyright (C) 2026 plasmactl contributors
 #
@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-VERSION="0.5.1"
+VERSION="0.6.0-dev"
 VERBOSE=false
 FIX_MODE=false
 PLASMA_ONLY=false
@@ -173,6 +173,12 @@ SUNSHINE_TCP_PORTS="${SUNSHINE_TCP_PORTS:-47984 47989 47990 48010}"
 SUNSHINE_UDP_PORTS="${SUNSHINE_UDP_PORTS:-47998 47999 48000 48010}"
 SUNSHINE_REQUIRED_TCP_PORTS="${SUNSHINE_REQUIRED_TCP_PORTS:-47990 48010}"
 WAIT_SUNSHINE_PORTS="${WAIT_SUNSHINE_PORTS:-20}"
+DISPLAY_RESOLUTION="${DISPLAY_RESOLUTION:-1920x1080}"
+DISPLAY_PORT_BASE="${DISPLAY_PORT_BASE:-47989}"
+WAIT_DISPLAY_OUTPUT="${WAIT_DISPLAY_OUTPUT:-15}"
+DISPLAY_ALLOW_PRIMARY_KMS="${DISPLAY_ALLOW_PRIMARY_KMS:-false}"
+KRFB_VIRTUALMONITOR_BIN="${KRFB_VIRTUALMONITOR_BIN:-$(command -v krfb-virtualmonitor 2>/dev/null || echo /usr/bin/krfb-virtualmonitor)}"
+KSCREEN_DOCTOR_BIN="${KSCREEN_DOCTOR_BIN:-$(command -v kscreen-doctor 2>/dev/null || echo /usr/bin/kscreen-doctor)}"
 WAIT_KWIN="${WAIT_KWIN:-45}"
 WAIT_WAYLAND="${WAIT_WAYLAND:-30}"
 WAIT_PLASMA="${WAIT_PLASMA:-45}"
@@ -2128,6 +2134,13 @@ _scope_load() {
         and (.units|type == "object")
         and (.units|to_entries|all(.key|test("^[a-zA-Z0-9_.@:\\\\-]+\\.(service|scope|target)$")))
         and (.units|to_entries|all(.value|type == "string" and test("^[a-f0-9]{32}$")))
+        and ((.displays // {})|type == "object" and (to_entries|all(
+            (.key|test("^[1-3]$")) and (.value|type == "object")
+            and (.value.output_unit|type == "string" and test("^plasmactl-display-[a-f0-9]{32}-[1-3]\\.service$"))
+            and (.value.sunshine_run|type == "string" and test("^[a-f0-9]{32}-s[1-3]$"))
+            and (.value.port|type == "number") and (.value.resolution|type == "string" and test("^[0-9]+x[0-9]+$"))
+            and (.value.output_invocation == null or (.value.output_invocation|type == "string" and test("^[a-f0-9]{32}$")))
+            and (.value.sunshine_invocation == null or (.value.sunshine_invocation|type == "string" and test("^[a-f0-9]{32}$"))))))
         and (.sunshine == null or (.sunshine|type == "object"
             and (.role == "igpu" or .role == "dgpu")
             and (.profile == "normal" or .profile == "safe" or .profile == "performance")
@@ -2246,10 +2259,21 @@ _scope_match_unit() {
     state="$(_scope_property "${properties}" ActiveState)"
     case "${state}" in inactive|failed) return 0 ;; esac
     current="$(_scope_property "${properties}" InvocationID)"
-    [[ "${current}" == "${expected}" && -n "${current}" ]] || {
-        err "Refusing to control a different invocation of ${unit}."
-        return 1
-    }
+    [[ "${current}" == "${expected}" && -n "${current}" ]] && return 0
+    # systemd restarts the shell on its own after a crash. Re-adopt only that
+    # unit, and only while its main process still carries this run's markers.
+    if [[ "${unit}" == plasma-plasmashell.service && "${current}" =~ ^[a-f0-9]{32}$ ]]; then
+        local run pid
+        run="$(jq -r '.run' "${SCOPE_STATE_FILE}")" || return 1
+        pid="$(_scope_property "${properties}" MainPID)"
+        if _scope_pid_owned "${pid}" "${run}"; then
+            _scope_update --arg u "${unit}" --arg i "${current}" '.units[$u] = $i' || return 1
+            log "Re-adopted restarted ${unit} (same run markers)."
+            return 0
+        fi
+    fi
+    err "Refusing to control a different invocation of ${unit}."
+    return 1
 }
 _scope_restore_environment() {
     local current before after key value
@@ -2296,6 +2320,11 @@ _scope_status() {
         info="$(_scope_sunshine_info)" || return 1
         printf 'Owned Sunshine: %s\n' "$(jq -r '.state' <<< "${info}")"
         _scope_sunshine_ready "${info}" || status=1
+        if jq -e '(.displays // {}) | length > 0' "${SCOPE_STATE_FILE}" >/dev/null; then
+            DISPLAY_LIST_DEGRADED=false
+            _display_list || true
+            [[ "${DISPLAY_LIST_DEGRADED}" == false ]] || status=1
+        fi
     else
         printf 'Plasma-only execution; Sunshine is disabled.\n'
     fi
@@ -2353,6 +2382,7 @@ _scope_stop() {
     done <<< "${units}"
     # The root helper independently rechecks the system-manager invocation.
     # Streaming must end before any desktop unit receives a stop request.
+    _scope_stop_displays || return 1
     _scope_stop_sunshine || return 1
     while IFS=$'\t' read -r unit invocation; do
         _scope_match_unit "${unit}" "${invocation}" || return 1
@@ -2553,6 +2583,483 @@ _scope_start() {
         err "Rollback could not prove or stop every component; state retained for review."
     fi
     return "${result}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXTRA DISPLAY STREAMS (scope backend)
+# ─────────────────────────────────────────────────────────────────────────────
+# One Sunshine instance captures one output. An extra stream pairs a virtual
+# KWin output (krfb-virtualmonitor) with its own managed Sunshine instance. The
+# instance has its own state, pairing and port block, and runs through the same
+# restricted helper as the primary service.
+
+_display_valid_index() { [[ "$1" =~ ^[1-3]$ ]]; }
+_display_valid_resolution() {
+    local width height
+    [[ "$1" =~ ^([0-9]{3,5})x([0-9]{3,5})$ ]] || return 1
+    width="${BASH_REMATCH[1]}"; height="${BASH_REMATCH[2]}"
+    (( 10#${width} >= 640 && 10#${width} <= 7680 && 10#${height} >= 480 && 10#${height} <= 4320 ))
+}
+_display_port() { printf '%s\n' $(( 10#${DISPLAY_PORT_BASE} + 1000 * $1 )); }
+_display_output_name() { printf 'plasmactl-d%s\n' "$1"; }
+_display_unit() { printf 'plasmactl-display-%s-%s.service\n' "$1" "$2"; }
+_display_sunshine_run() { printf '%s-s%s\n' "$1" "$2"; }
+_display_config() { printf '%s/plasmactl-display%s.conf\n' "${SUNSHINE_CONFIG_DIR}" "$1"; }
+_display_apps() { printf '%s/plasmactl-apps-display%s.json\n' "${SUNSHINE_CONFIG_DIR}" "$1"; }
+_display_tcp_ports() { local port; port="$(_display_port "$1")"; printf '%s %s %s %s\n' $(( port - 5 )) "${port}" $(( port + 1 )) $(( port + 21 )); }
+_display_udp_ports() { local port; port="$(_display_port "$1")"; printf '%s %s %s\n' $(( port + 9 )) $(( port + 10 )) $(( port + 11 )); }
+
+_display_adapter() {
+    local card pci node
+    card="$(basename "$(jq -r '.gpu' "${SCOPE_STATE_FILE}")")" || return 1
+    pci="$(basename "$(readlink -f "/sys/class/drm/${card}/device" 2>/dev/null)")" || return 1
+    node="/dev/dri/by-path/pci-${pci}-render"
+    [[ "${pci}" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ && -e "${node}" ]] || return 1
+    printf '%s\n' "${node}"
+}
+
+# Publish absent assets only. Operator edits to an existing profile are kept.
+_display_prepare_config() {
+    local idx="$1" adapter="$2" port target apps stage name result=0
+    port="$(_display_port "${idx}")"
+    target="$(_display_config "${idx}")"; apps="$(_display_apps "${idx}")"
+    [[ ! -e "${target}" && ! -L "${target}" ]] || { [[ -f "${target}" && ! -L "${target}" ]]; return; }
+    name="$(hostname 2>/dev/null || echo host)-display${idx}"
+    mkdir -p "${SUNSHINE_CONFIG_DIR}/credentials" || return 1
+    chmod 700 "${SUNSHINE_CONFIG_DIR}/credentials" || return 1
+    stage="$(mktemp -d "${SUNSHINE_CONFIG_DIR}/.plasmactl-display.XXXXXX")" || return 1
+    cat > "${stage}/conf" <<EOF_DISPLAY_CONF
+# Generated by plasmactl v${VERSION} for display stream ${idx}.
+# Extra stream: virtual KWin output, own state, pairing and ports.
+
+sunshine_name = ${name}
+min_log_level = info
+system_tray = disabled
+
+address_family = ipv4
+bind_address = 0.0.0.0
+port = ${port}
+upnp = disabled
+origin_web_ui_allowed = lan
+lan_encryption_mode = 1
+wan_encryption_mode = 2
+
+keyboard = enabled
+mouse = enabled
+controller = disabled
+stream_audio = disabled
+
+file_apps = $(basename "${apps}")
+log_path = ${SUNSHINE_CONFIG_DIR}/sunshine-display${idx}.log
+credentials_file = sunshine_state_display${idx}.json
+file_state = sunshine_state_display${idx}.json
+pkey = ${SUNSHINE_CONFIG_DIR}/credentials/cakey-display${idx}.pem
+cert = ${SUNSHINE_CONFIG_DIR}/credentials/cacert-display${idx}.pem
+
+adapter_name = ${adapter}
+output_name = Virtual-$(_display_output_name "${idx}")
+capture = kwin
+encoder = vaapi
+minimum_fps_target = 60
+EOF_DISPLAY_CONF
+    cat > "${stage}/apps" <<'EOF_DISPLAY_APPS'
+{
+  "env": {},
+  "apps": [
+    {
+      "name": "Desktop",
+      "image-path": "desktop.png"
+    }
+  ]
+}
+EOF_DISPLAY_APPS
+    if [[ ! -e "${apps}" && ! -L "${apps}" ]]; then ln -- "${stage}/apps" "${apps}" || result=$?; fi
+    (( result == 0 )) && { ln -- "${stage}/conf" "${target}" || result=$?; }
+    rm -rf -- "${stage}"
+    return "${result}"
+}
+
+_display_user_env() {
+    env "XDG_RUNTIME_DIR=${RUNTIME_DIR}" "DBUS_SESSION_BUS_ADDRESS=unix:path=${RUNTIME_DIR}/bus" "$@"
+}
+
+_display_output_present() {
+    local name wayland="$2"
+    name="Virtual-$(_display_output_name "$1")"
+    _display_user_env "WAYLAND_DISPLAY=${wayland}" "${KSCREEN_DOCTOR_BIN}" -o 2>/dev/null |
+        sed 's/\x1b\[[0-9;]*m//g' | grep -Eq "^Output: [0-9]+ ${name}( |$)"
+}
+
+_display_sunshine_info() {
+    local idx="$1" run role srun info
+    run="$(jq -r '.run' "${SCOPE_STATE_FILE}")" || return 1
+    role="$(jq -r '.sunshine.role' "${SCOPE_STATE_FILE}")" || return 1
+    srun="$(_display_sunshine_run "${run}" "${idx}")"
+    info="$(_scope_sunshine_helper status "${srun}" "${role}")" || return 1
+    jq -e --arg unit "plasmactl-sunshine-u${REAL_UID}-${role}@${srun}.service" '.unit == $unit
+        and (.recorded|type == "boolean") and (.state|type == "string") and (.invocation|type == "string")
+        and (.listeners|type == "array" and all(.[]; type == "number"))' <<< "${info}" >/dev/null || return 1
+    printf '%s\n' "${info}"
+}
+
+_display_sunshine_ready() {
+    local idx="$1" info="$2" invocation port
+    invocation="$(jq -r --arg i "${idx}" '.displays[$i].sunshine_invocation // empty' "${SCOPE_STATE_FILE}")" || return 1
+    [[ -n "${invocation}" ]] || return 1
+    jq -e --arg inv "${invocation}" '.recorded and .state == "active" and .invocation == $inv' <<< "${info}" >/dev/null || return 1
+    port="$(_display_port "${idx}")"
+    for port in $(( port + 1 )) $(( port + 21 )); do
+        jq -e --argjson p "${port}" '.listeners|index($p) != null' <<< "${info}" >/dev/null || return 1
+    done
+}
+
+# Absolute pointer input spans KWin's whole desktop. KMS capture only knows real
+# connectors, so a primary stream on KMS maps the pointer over its own output
+# alone and the virtual output shifts it. Capture through KWin sees every output.
+_display_conf_get() {
+    sed -nE "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*\$/\\1/p" "$1" 2>/dev/null | tail -n 1
+}
+
+_display_primary_capture_error() {
+    local profile file capture output
+    profile="$(jq -r '.sunshine.profile // empty' "${SCOPE_STATE_FILE}")"
+    case "${profile}" in
+        normal) file="${SUNSHINE_DEFAULT_CONFIG}" ;;
+        safe) file="${SUNSHINE_SAFE_CONFIG}" ;;
+        performance) file="${SUNSHINE_PERF_CONFIG}" ;;
+        *) printf 'The primary Sunshine profile is unknown.\n'; return 0 ;;
+    esac
+    [[ -f "${file}" ]] || { printf 'The primary Sunshine profile %s is missing.\n' "${file}"; return 0; }
+    capture="$(_display_conf_get "${file}" capture)"; output="$(_display_conf_get "${file}" output_name)"
+    if [[ "${capture}" != kwin ]]; then
+        printf 'The primary profile captures with "%s". Absolute mouse input would be mapped over the primary output only and miss the virtual output. Set capture = kwin and output_name = <primary output> in %s (profiles generated with SUNSHINE_PERF_CAPTURE=kwin do this), restart, and retry.\n' "${capture:-auto}" "${file}"
+    elif [[ -z "${output}" || "${output}" =~ ^[0-9]+$ ]]; then
+        printf 'KWin capture needs output_name set to the primary output name (for example HDMI-A-1) in %s. Without it Sunshine can pick any output, including the virtual one.\n' "${file}"
+    fi
+}
+
+# KScreen remembers positions per output set and can put a new virtual output
+# left of the real desktop. Keep real outputs anchored at the origin and place
+# extra outputs to their right, in slot order. Reads kscreen-doctor -j on stdin.
+_display_layout_args() {
+    jq -r '
+        .outputs as $o
+        | ($o | map(select(.name | startswith("Virtual-plasmactl-d") | not)) | map(select(.enabled != false))) as $real
+        | if ($real | length) == 0 then empty else
+          ($real | map(.pos.x) | min) as $min
+          | ($real | map({name, x: (.pos.x - $min), y: .pos.y, w: ((.size.width / (.scale // 1)) | floor)})) as $r
+          | ($r | map(.x + .w) | max) as $right
+          | ($o | map(select(.name | startswith("Virtual-plasmactl-d"))) | sort_by(.name)) as $e
+          | ($r[] | "output.\(.name).position.\(.x),\(.y)"),
+            (reduce range(0; $e | length) as $i ({x: $right, out: []};
+                .out += ["output.\($e[$i].name).position.\(.x),0"]
+                | .x += (($e[$i].size.width / ($e[$i].scale // 1)) | floor)) | .out[])
+          end'
+}
+
+_display_arrange() {
+    local wayland="$1" args=()
+    mapfile -t args < <(_display_user_env "WAYLAND_DISPLAY=${wayland}" "${KSCREEN_DOCTOR_BIN}" -j 2>/dev/null | _display_layout_args)
+    (( ${#args[@]} > 0 )) || return 1
+    _display_user_env "WAYLAND_DISPLAY=${wayland}" "${KSCREEN_DOCTOR_BIN}" "${args[@]}" >/dev/null 2>&1
+}
+
+# Taskbar for an extra output. Panels bind to a screen index, so the panel is
+# matched by the output's geometry. Remove it before the output disappears: a
+# panel left on a vanished screen crashed plasmashell (SIGSEGV in KConfigGroup).
+_display_output_geometry() {
+    _display_user_env "WAYLAND_DISPLAY=$1" "${KSCREEN_DOCTOR_BIN}" -j 2>/dev/null |
+        jq -r --arg n "$2" '.outputs[] | select(.name == $n) | "\(.pos.x) \(.pos.y) \(.size.width) \(.size.height)"'
+}
+
+_display_panel_eval() {
+    local action="$1" geom="$2" x y w h
+    read -r x y w h <<< "${geom}"
+    [[ "${x}" =~ ^-?[0-9]+$ && "${y}" =~ ^-?[0-9]+$ && "${w}" =~ ^[0-9]+$ && "${h}" =~ ^[0-9]+$ ]] || return 1
+    local js
+    js="var X=${x},Y=${y},W=${w},H=${h},action='${action}',idx=-1;
+for (var s = 0; s < screenCount; s++) { var g = screenGeometry(s);
+  if (g.x === X && g.y === Y && g.width === W && g.height === H) { idx = s; } }
+if (idx < 0) { print('no-screen'); }
+else if (action === 'check') { print(panels().some(function (p) { return p.screen === idx; }) ? 'present' : 'absent'); }
+else if (action === 'remove') {
+  panels().forEach(function (p) { if (p.screen === idx) { p.remove(); } });
+  print('removed');
+} else if (panels().some(function (p) { return p.screen === idx; })) { print('present'); }
+else {
+  var p = new Panel; p.location = 'bottom'; p.height = 30; p.screen = idx;
+  ['org.kde.plasma.kickoff','org.kde.plasma.pager','org.kde.plasma.icontasks','org.kde.plasma.marginsseparator','org.kde.plasma.systemtray','org.kde.plasma.digitalclock','org.kde.plasma.showdesktop'].forEach(function (t) { p.addWidget(t); });
+  print('added');
+}"
+    _display_user_env qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "${js}"
+}
+
+_display_taskbar() {
+    local action="$1" wayland="$2" name="$3" geom out ticks=0
+    geom="$(_display_output_geometry "${wayland}" "${name}")"
+    [[ -n "${geom}" ]] || return 1
+    if [[ "${action}" == add ]]; then
+        # plasmashell learns about the new screen asynchronously, and KScreen's
+        # arrangement can make it rebuild containments. Add, let the layout
+        # settle, then confirm the panel is still there; add again if it is not.
+        local _attempt
+        for _attempt in 1 2 3; do
+            while (( ticks < 10 )); do
+                out="$(_display_panel_eval add "${geom}" 2>/dev/null || true)"
+                [[ "${out}" == no-screen ]] || break
+                sleep 1; (( ticks += 1 ))
+            done
+            # An orphan from an earlier removal can still be pending in plasmashell
+            # and disappear after this check, taking a new panel with it. Give it
+            # time to settle, then confirm.
+            sleep 8
+            [[ "$(_display_panel_eval check "${geom}" 2>/dev/null || true)" == present ]] && return 0
+            ticks=0
+        done
+        return 1
+    else
+        # Removal takes effect asynchronously. Stopping the output first leaves
+        # an orphaned panel, which crashes plasmashell, so wait until it is gone.
+        out="$(_display_panel_eval remove "${geom}" 2>/dev/null || true)"
+        [[ "${out}" == removed || "${out}" == no-screen ]] || return 1
+        while (( ticks < 20 )); do
+            out="$(_display_panel_eval check "${geom}" 2>/dev/null || true)"
+            [[ "${out}" == absent ]] && return 0
+            sleep 0.5; (( ticks += 1 ))
+        done
+        return 1
+    fi
+}
+
+# Panels bound to a screen index that no longer exists are orphans. Remove them
+# only after the output is gone, which is the state seen to be safe.
+# plasmashell applies the screen change asynchronously and can flag an orphan
+# only after a delay, so run the removal for a fixed window instead of stopping
+# at the first pass that finds nothing.
+_display_remove_orphan_panels() {
+    local ticks=0
+    while (( ticks < 6 )); do
+        _display_user_env qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript \
+            'panels().forEach(function (p) { if (p.screen >= screenCount) { p.remove(); } });' >/dev/null 2>&1 || true
+        sleep 2; (( ticks += 1 ))
+    done
+}
+
+_display_unit_state() {
+    local properties
+    properties="$(_scope_unit "$1")" || return 1
+    _scope_property "${properties}" ActiveState
+}
+
+# Stop the stream's Sunshine, then its output. Identity must match the record.
+_display_teardown() {
+    local idx="$1" run role info recorded current unit properties output_inv ticks=0
+    run="$(jq -r '.run' "${SCOPE_STATE_FILE}")"; role="$(jq -r '.sunshine.role // empty' "${SCOPE_STATE_FILE}")"
+    [[ -n "${role}" ]] || { err "Display ${idx} has no recorded Sunshine role; manual review is required."; return 1; }
+    info="$(_display_sunshine_info "${idx}")" || return 1
+    recorded="$(jq -r --arg i "${idx}" '.displays[$i].sunshine_invocation // empty' "${SCOPE_STATE_FILE}")"
+    current="$(jq -r '.invocation' <<< "${info}")"
+    case "$(jq -r '.state' <<< "${info}")" in
+        inactive|failed) ;;
+        *) [[ -n "${recorded}" && "${recorded}" == "${current}" ]] || {
+            err "Display ${idx} Sunshine invocation changed or was not recorded; refusing stop."; return 1;
+        } ;;
+    esac
+    if jq -e '.recorded' <<< "${info}" >/dev/null; then
+        _scope_sunshine_helper stop "$(_display_sunshine_run "${run}" "${idx}")" "${role}" \
+            "${recorded:-00000000000000000000000000000000}" >/dev/null || return 1
+    fi
+    unit="$(jq -r --arg i "${idx}" '.displays[$i].output_unit' "${SCOPE_STATE_FILE}")"
+    output_inv="$(jq -r --arg i "${idx}" '.displays[$i].output_invocation // empty' "${SCOPE_STATE_FILE}")"
+    properties="$(_scope_unit "${unit}")" || return 1
+    case "$(_scope_property "${properties}" ActiveState)" in
+        inactive|failed) ;;
+        *)
+            _display_taskbar remove "$(jq -r '.wayland // empty' "${SCOPE_STATE_FILE}")" \
+                "$(jq -r --arg i "${idx}" '.displays[$i].output // empty' "${SCOPE_STATE_FILE}")" || {
+                err "Display ${idx} taskbar was not removed; its output stays up to avoid a plasmashell crash. Remove the panel in the panel settings, then retry."; return 1; }
+            [[ -n "${output_inv}" && "$(_scope_property "${properties}" InvocationID)" == "${output_inv}" ]] || {
+                err "Display ${idx} output invocation changed or was not recorded; refusing stop."; return 1;
+            }
+            _scope_systemctl stop -- "${unit}" || return 1
+            while (( ticks < WAIT_STOP * 5 )); do
+                case "$(_display_unit_state "${unit}")" in inactive|failed) break ;; esac
+                sleep 0.2; (( ticks += 1 ))
+            done
+            case "$(_display_unit_state "${unit}")" in inactive|failed) ;; *)
+                err "Display ${idx} output did not stop; state retained."; return 1 ;; esac ;;
+    esac
+    _scope_update --arg i "${idx}" 'del(.displays[$i]) | if (.displays|length) == 0 then del(.displays) else . end' || return 1
+    _display_arrange "$(jq -r '.wayland // empty' "${SCOPE_STATE_FILE}")" || true
+    _display_remove_orphan_panels
+}
+
+_scope_stop_displays() {
+    local idx
+    jq -e '(.displays // {}) | length > 0' "${SCOPE_STATE_FILE}" >/dev/null 2>&1 || return 0
+    for idx in $(jq -r '.displays|keys[]' "${SCOPE_STATE_FILE}"); do
+        _display_teardown "${idx}" || return 1
+    done
+}
+
+_display_add() {
+    local idx="$1" resolution="$2" run role sid wayland adapter unit srun info port ticks=0 invocation result=0 name
+    run="$(jq -r '.run' "${SCOPE_STATE_FILE}")"; sid="$(jq -r '.sid' "${SCOPE_STATE_FILE}")"
+    role="$(jq -r '.sunshine.role // empty' "${SCOPE_STATE_FILE}")"
+    wayland="$(jq -r '.wayland // empty' "${SCOPE_STATE_FILE}")"
+    jq -e '.phase == "running"' "${SCOPE_STATE_FILE}" >/dev/null || { err "The managed execution is not running."; return 1; }
+    [[ -n "${role}" && -n "${wayland}" ]] && jq -e '.sunshine != null and (.sunshine.stopped|not)' "${SCOPE_STATE_FILE}" >/dev/null || {
+        err "Extra displays need a running managed Sunshine; this execution has none."; return 1; }
+    if jq -e --arg i "${idx}" '(.displays // {})[$i] != null' "${SCOPE_STATE_FILE}" >/dev/null; then
+        err "Display ${idx} already exists; remove it first."; return 1
+    fi
+    command -v "${KRFB_VIRTUALMONITOR_BIN}" >/dev/null && command -v "${KSCREEN_DOCTOR_BIN}" >/dev/null || {
+        err "krfb-virtualmonitor and kscreen-doctor are required for extra displays."; return 1; }
+    info="$(_scope_sunshine_info)" || return 1
+    _scope_sunshine_ready "${info}" || { err "The primary managed Sunshine is not ready."; return 1; }
+    if ! _bool_true "${DISPLAY_ALLOW_PRIMARY_KMS}"; then
+        info="$(_display_primary_capture_error)"
+        [[ -z "${info}" ]] || { err "${info}"; return 1; }
+    fi
+    for port in $(_display_tcp_ports "${idx}") ; do
+        ! _tcp_port_listening "${port}" || { err "TCP port ${port} is already in use; display ${idx} cannot start."; return 1; }
+    done
+    for port in $(_display_udp_ports "${idx}") ; do
+        ! _udp_port_listening "${port}" || { err "UDP port ${port} is already in use; display ${idx} cannot start."; return 1; }
+    done
+    adapter="$(_display_adapter)" || { err "Cannot resolve the selected GPU render node."; return 1; }
+    _display_prepare_config "${idx}" "${adapter}" || { err "Cannot publish the display ${idx} Sunshine profile."; return 1; }
+    unit="$(_display_unit "${run}" "${idx}")"; srun="$(_display_sunshine_run "${run}" "${idx}")"
+    name="$(_display_output_name "${idx}")"
+    # Record intent before creating anything, so rollback can find the resources.
+    _scope_update --arg i "${idx}" --arg unit "${unit}" --arg srun "${srun}" --arg res "${resolution}" \
+        --argjson port "$(_display_port "${idx}")" --arg out "Virtual-${name}" \
+        '.displays = ((.displays // {}) + {($i): {output_unit:$unit,output_invocation:null,sunshine_run:$srun,
+            sunshine_invocation:null,port:$port,resolution:$res,output:$out}})' || return 1
+
+    _display_user_env systemd-run --user --collect --quiet --unit="${unit}" \
+        "--setenv=WAYLAND_DISPLAY=${wayland}" --setenv=QT_QPA_PLATFORM=wayland \
+        -- "${KRFB_VIRTUALMONITOR_BIN}" --name "${name}" --resolution "${resolution}" || result=$?
+    if (( result == 0 )); then
+        invocation="$(_scope_property "$(_scope_unit "${unit}")" InvocationID)"
+        if [[ "${invocation}" =~ ^[a-f0-9]{32}$ ]]; then
+            _scope_update --arg i "${idx}" --arg inv "${invocation}" '.displays[$i].output_invocation = $inv' || result=1
+        else
+            result=1
+        fi
+    fi
+    while (( result == 0 && ticks < WAIT_DISPLAY_OUTPUT * 5 )); do
+        _display_output_present "${idx}" "${wayland}" && break
+        sleep 0.2; (( ticks += 1 ))
+    done
+    (( result != 0 || ticks < WAIT_DISPLAY_OUTPUT * 5 )) || { err "KWin did not report output Virtual-${name}."; result=1; }
+    (( result != 0 )) || _display_arrange "${wayland}" || err "Could not arrange the outputs; check the layout in the display settings."
+    (( result != 0 )) || _display_taskbar add "${wayland}" "Virtual-${name}" || err "Could not add a taskbar to Virtual-${name}; add one from the panel settings."
+
+    if (( result == 0 )); then
+        _scope_sunshine_helper start "${srun}" "${role}" "${sid}" "${wayland}" "display${idx}" >/dev/null || result=$?
+        # Query even after a failed start: preserve any identity for rollback.
+        if info="$(_display_sunshine_info "${idx}")"; then
+            invocation="$(jq -r '.invocation' <<< "${info}")"
+            if [[ "${invocation}" =~ ^[a-f0-9]{32}$ ]] && jq -e '.recorded' <<< "${info}" >/dev/null; then
+                _scope_update --arg i "${idx}" --arg inv "${invocation}" '.displays[$i].sunshine_invocation = $inv' || result=1
+            fi
+        else
+            result=1
+        fi
+    fi
+    ticks=0
+    while (( result == 0 && ticks < WAIT_SUNSHINE_PORTS )); do
+        _display_sunshine_ready "${idx}" "${info}" && break
+        [[ "$(jq -r '.state' <<< "${info}")" == active ]] || break
+        sleep 1; (( ticks += 1 ))
+        info="$(_display_sunshine_info "${idx}")" || { result=1; break; }
+    done
+    if (( result == 0 )) && ! _display_sunshine_ready "${idx}" "${info}"; then
+        err "Display ${idx} Sunshine did not open its listeners."; result=1
+    fi
+    if (( result != 0 )); then
+        err "Display ${idx} failed to start; rolling back its own resources."
+        _display_teardown "${idx}" || err "Rollback could not prove or stop every display component; state retained for review."
+        return 1
+    fi
+    # Starting the capture can make KWin relayout and plasmashell rebuild its
+    # containments, so confirm the taskbar once more now that everything is up.
+    if [[ "$(_display_panel_eval check "$(_display_output_geometry "${wayland}" "Virtual-${name}")" 2>/dev/null || true)" != present ]]; then
+        _display_taskbar add "${wayland}" "Virtual-${name}" || err "The taskbar of Virtual-${name} was lost after startup; add one from the panel settings."
+    fi
+    port="$(_display_port "${idx}")"
+    log "Display ${idx} ready: output Virtual-${name} (${resolution}), Sunshine on port ${port}."
+    _display_print_next_steps "${idx}"
+}
+
+_display_print_next_steps() {
+    local idx="$1" port
+    port="$(_display_port "${idx}")"
+    printf '\nMoonlight: add host <this-host>:%s once, then pair with the PIN form of the Sunshine web UI at https://<this-host>:%s (first visit asks for a new username and password).\n' "${port}" $(( port + 1 ))
+    printf 'The host firewall is not changed. Open the ports from the client network only:\n'
+    _display_print_firewall "${idx}"
+}
+
+_display_print_firewall() {
+    local idx="$1" tcp udp
+    tcp="$(_display_tcp_ports "${idx}" | tr ' ' ',')"; udp="$(_display_udp_ports "${idx}" | tr ' ' ',')"
+    printf '  ufw allow from <client-network> to any port %s proto tcp\n' "${tcp}"
+    printf '  ufw allow from <client-network> to any port %s proto udp\n' "${udp}"
+}
+
+_display_list() {
+    local idx found=false out_state sun_state info
+    for idx in $(jq -r '(.displays // {})|keys[]' "${SCOPE_STATE_FILE}"); do
+        found=true
+        out_state="$(_display_unit_state "$(jq -r --arg i "${idx}" '.displays[$i].output_unit' "${SCOPE_STATE_FILE}")")" || out_state=unknown
+        if info="$(_display_sunshine_info "${idx}")"; then sun_state="$(jq -r '.state' <<< "${info}")"; else sun_state=unknown; fi
+        printf 'display %s: %s output=%s Sunshine=%s port=%s\n' "${idx}" \
+            "$(jq -r --arg i "${idx}" '.displays[$i].resolution' "${SCOPE_STATE_FILE}")" "${out_state}" "${sun_state}" \
+            "$(jq -r --arg i "${idx}" '.displays[$i].port' "${SCOPE_STATE_FILE}")"
+        [[ "${out_state}" == active && "${sun_state}" == active ]] || DISPLAY_LIST_DEGRADED=true
+    done
+    [[ "${found}" == true ]] || printf 'No extra displays are recorded.\n'
+}
+
+cmd_display() {
+    _LOG_CTX="display"
+    local action="${1:-}" idx="${2:-}" resolution="${3:-${DISPLAY_RESOLUTION}}" taken
+    DISPLAY_LIST_DEGRADED=false
+    case "${action}" in add|remove|list|firewall) ;; *) err "Usage: display add [1-3] [WxH] | remove <1-3|all> | list | firewall [1-3]"; return 2 ;; esac
+    [[ "${DISPLAY_PORT_BASE}" =~ ^[0-9]{4,5}$ ]] && (( 10#${DISPLAY_PORT_BASE} >= 1030 && 10#${DISPLAY_PORT_BASE} + 3021 <= 65535 )) || {
+        err "DISPLAY_PORT_BASE must be a port between 1030 and 62514."; return 2; }
+    acquire_lock || return 1
+    [[ -f "${SCOPE_STATE_FILE}" && ! -L "${SCOPE_STATE_FILE}" ]] || { err "No managed execution is recorded."; return 1; }
+    _scope_stale_boot && { err "Scope record belongs to a previous boot; run stop first."; return 1; }
+    _scope_load || return 1
+    case "${action}" in
+        add)
+            if [[ -z "${idx}" ]]; then
+                for taken in 1 2 3; do
+                    jq -e --arg i "${taken}" '(.displays // {})[$i] == null' "${SCOPE_STATE_FILE}" >/dev/null && { idx="${taken}"; break; }
+                done
+                [[ -n "${idx}" ]] || { err "All display slots are in use."; return 1; }
+            fi
+            _display_valid_index "${idx}" || { err "Display index must be 1, 2 or 3."; return 2; }
+            _display_valid_resolution "${resolution}" || { err "Resolution must look like 1920x1080 (640x480 to 7680x4320)."; return 2; }
+            _display_add "${idx}" "${resolution}" ;;
+        remove)
+            if [[ "${idx}" == all ]]; then _scope_stop_displays; return $?; fi
+            _display_valid_index "${idx}" || { err "Display index must be 1, 2, 3 or all."; return 2; }
+            jq -e --arg i "${idx}" '(.displays // {})[$i] != null' "${SCOPE_STATE_FILE}" >/dev/null || { err "Display ${idx} is not recorded."; return 1; }
+            _display_teardown "${idx}" ;;
+        list) _display_list; [[ "${DISPLAY_LIST_DEGRADED}" == false ]] ;;
+        firewall)
+            if [[ -n "${idx}" ]]; then
+                _display_valid_index "${idx}" || { err "Display index must be 1, 2 or 3."; return 2; }
+                _display_print_firewall "${idx}"
+            else
+                for taken in $(jq -r '(.displays // {})|keys[]' "${SCOPE_STATE_FILE}"); do
+                    printf 'display %s:\n' "${taken}"; _display_print_firewall "${taken}"
+                done
+            fi ;;
+    esac
 }
 
 cmd_start() {
@@ -3580,6 +4087,7 @@ Commands:
   stop            Stop Sunshine/Plasma and lock physical tmux console
   restart         stop + start
   status          Health check all components
+  display         Extra Moonlight displays (scope backend): add [1-3] [WxH] | remove <1-3|all> | list | firewall [1-3]
   doctor          Diagnose prerequisites
   detect-gpu      Show DRM device map and selected target
   session-check   Inspect login and systemd conflicts before a new execution
@@ -3664,6 +4172,9 @@ _validate_cli_arguments() {
         fi
     fi
     case "${command}" in
+        display)
+            [[ "${count}" -ge 2 && "${count}" -le 4 ]] || { echo "ERROR: display needs an action: add [1-3] [WxH] | remove <1-3|all> | list | firewall [1-3]" >&2; return 2; }
+            ;;
         start|stop|restart|status|doctor|detect-gpu|session-check|headless-check|list|debug|cleanup|attach|sunshine-safe|sunshine-profiles|profiles|config-snapshot|config-template|sanity|confirm-igpu|confirm-dgpu|gpu-assert|--help|-h|help)
             [[ "${count}" -le 1 ]] || { echo "ERROR: '${command}' does not accept positional arguments" >&2; return 2; }
             ;;
@@ -3704,6 +4215,7 @@ case "${1:-}" in
     stop)       cmd_stop ;;
     restart)    cmd_restart ;;
     status)     cmd_status ;;
+    display)    shift; cmd_display "$@" ;;
     doctor)     cmd_doctor ;;
     detect-gpu) cmd_detect_gpu ;;
     session-check) cmd_session_check ;;

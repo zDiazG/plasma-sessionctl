@@ -47,6 +47,7 @@ Running a remote streaming desktop with KDE Plasma Wayland and Sunshine on multi
 - The managed Sunshine candidate uses a fixed system service under the desktop UID with a DRM device allowlist. The restriction covers that service and its children.
 - The scope backend records launcher/native-unit identities and stops the recorded Sunshine before desktop teardown. The default legacy backend retains UID-wide process cleanup.
 - Scope starts preserve existing Sunshine profiles and application lists. Explicit profile-generation commands can replace those assets.
+- One Sunshine instance streams one output. Optional extra displays (scope backend) add a virtual KWin output and a second managed Sunshine instance per output; see [Extra displays](#extra-displays). Sunshine instances or virtual outputs started by hand stay outside `plasmactl` ownership.
 - EDID/bootloader operations are separate commands and require a host-specific recovery plan.
 - Legacy GPU diagnostics inspect processes, journals and descriptors. They have not been migrated to the managed Sunshine identity and can be inconclusive.
 
@@ -58,6 +59,7 @@ Running a remote streaming desktop with KDE Plasma Wayland and Sunshine on multi
 - **Desktop**: KDE Plasma Wayland (`startplasma-wayland`, `kwin_wayland`).
 - **Streamer**: Sunshine (`sunshine`).
 - **Session Manager**: `tmux`.
+- **Extra displays** (optional): `krfb` (`krfb-virtualmonitor`) and `kscreen-doctor`, plus the extended Sunshine helper from this release.
 - **Privileges**: reviewed caller-specific helper policy for the scope backend. The legacy unrestricted sudoers grant is retired.
 - **Scope backend**: `jq`, `busctl`, `systemd-run` and `flock`; Python 3 for the managed Sunshine helper. Installed native Plasma units and an existing login/tmux session are required.
 - **Legacy JSON overlay**: optional `jq`. Only the observed systemd/Plasma combination has runtime evidence; other versions need validation.
@@ -138,6 +140,10 @@ plasmactl --dgpu start          # Select the discrete GPU role
 plasmactl stop                  # Stop using the recorded/configured backend
 plasmactl restart               # Stop active session and start a new one
 plasmactl status                # Inspect backend state; does not prove streaming
+plasmactl display add           # Add a virtual output and its own Sunshine stream (scope backend)
+plasmactl display list          # List extra displays and their state
+plasmactl display remove 1      # Stop one extra display (or: remove all)
+plasmactl display firewall      # Print firewall rules for the recorded displays
 plasmactl session-check         # Inspect login and user-unit prerequisites for a new execution
 plasmactl sanity                # Validate binaries, DRM nodes, TTYs, and permissions
 plasmactl detect-gpu            # Auto-detect available iGPU and dGPU cards and drivers
@@ -235,6 +241,51 @@ restart a getty. Initial support is one configured desktop UID per host.
 The managed Sunshine path is a development candidate. Isolated tests and unit
 syntax checks do not establish capture, device enforcement or streaming.
 
+### Extra displays
+
+Optional and off by default. With a running scope execution and managed Sunshine,
+`plasmactl display add [1-3] [WxH]` creates a virtual KWin output with
+`krfb-virtualmonitor` and starts a second managed Sunshine instance that captures
+only that output. One Plasma session, one clipboard and one set of applications
+remain, so windows move between outputs. Moonlight sees the extra stream as one
+more host in its normal profile: add `<host>:<port>` once, pair, then open
+another Moonlight window and connect to it.
+
+```bash
+plasmactl display add                 # lowest free slot, DISPLAY_RESOLUTION (default 1920x1080)
+plasmactl display add 2 2560x1440     # slot 2 at a chosen size
+plasmactl display list
+plasmactl display firewall 1          # rules to apply yourself; plasmactl never edits the firewall
+plasmactl display remove 1            # or: remove all
+```
+
+Each slot uses its own port block (`DISPLAY_PORT_BASE + 1000 * slot`; slot 1 is
+48989 by default), its own pairing and state, and a generated profile
+`~/.config/sunshine/plasmactl-display<N>.conf` that is never overwritten. The
+helper keeps the same device allowlist as the primary service. Limits:
+
+- The primary profile must capture through KWin: `capture = kwin` and `output_name = <primary output>` (for example `HDMI-A-1`). KMS capture only knows real connectors, so it maps absolute mouse input over the primary output alone, while KWin spreads an absolute pointer over the whole extended desktop. With KMS the cursor lands on the virtual output from about the middle of the primary window. `display add` refuses to continue until the profile is fixed; `DISPLAY_ALLOW_PRIMARY_KMS=true` skips the check. Edit the profile by hand, because `plasmactl` never rewrites an existing one.
+- `display add` also arranges the outputs: real outputs start at 0,0 and extra outputs follow to their right in slot order, because KScreen can otherwise place the new output on the left.
+- In Moonlight's absolute (remote desktop) mouse mode each window controls only its own output, so the pointer cannot cross from one window to the other. To cross, switch the window to relative (game) mouse mode and capture the pointer, or move windows with the keyboard (Meta+Shift+Arrow).
+- Extra streams carry no audio (`stream_audio = disabled`); the primary stream keeps it.
+- The Sunshine web UI of each stream asks for its own first username and password.
+- Run `display firewall` and open the ports from the client network only.
+- `stop` removes extra displays first. `restart` does not recreate them.
+- Two Moonlight windows can share one client profile, but a window that was open
+  before the new host was added may not know it. Restart that window if the host is missing.
+- Moonlight does not choose a client monitor for a window; place windows with the client's window rules.
+- Deleting `~/.config/sunshine/sunshine_state_display<N>.json` gives that slot a new host identity and drops its pairing. Moonlight then reports an unexpected host until you remove the old entry and pair again.
+- `display add` tries to add a bottom taskbar on the new output, and `display remove` tries to remove it. Both are best effort. Plasma can drop the panel after the add (the controller checks again once Sunshine is up and re-adds it), and a removal can leave an orphaned panel that crashes plasmashell on its next start. If `display remove` reports that the taskbar was not removed, it keeps the output up on purpose. Remove the panel in the panel settings, then retry. If `plasmashell` crashes or shows a panel on a missing screen, delete that panel in the panel settings.
+- If systemd restarts plasmashell (for example after a crash), the next `plasmactl` command re-adopts the new invocation, but only while the process still carries this run's markers. Any other unit with a changed invocation is still refused.
+- Clipboard sync is not part of Moonlight or Sunshine. Use a session-level tool such as KDE Connect;
+  one clipboard serves every output.
+
+Add, remove, `restart` and re-add were exercised on one Intel iGPU host with
+Moonlight 6.2 on a second machine. Two 1080p60 streams (primary H.264, extra
+HEVC) ran together with hardware encode on the iGPU and the extra stream's
+service held to the closed device policy. Frame rate, latency and long-term
+reliability were not measured, and the dGPU roles are untested.
+
 ### Flags
 
 - `--igpu` — Force session to run on the Integrated GPU (iGPU).
@@ -319,6 +370,14 @@ SUNSHINE_IGPU_LIBVA_DRIVER_NAME=iHD
 SUNSHINE_UDP_PORTS="47998 47999 48000 48002 48010"
 SUNSHINE_SYSTEMD_ISOLATE_DRI=true
 SUNSHINE_SYSTEMD_ASSERT_MODE=journal
+
+# Extra displays (scope backend)
+DISPLAY_RESOLUTION=1920x1080          # default size for display add
+DISPLAY_ALLOW_PRIMARY_KMS=false        # true skips the primary capture check
+DISPLAY_PORT_BASE=47989               # primary Sunshine port; slot N uses base + 1000 * N
+WAIT_DISPLAY_OUTPUT=15                # seconds to wait for KWin to report the output
+KRFB_VIRTUALMONITOR_BIN=/usr/bin/krfb-virtualmonitor
+KSCREEN_DOCTOR_BIN=/usr/bin/kscreen-doctor
 ```
 
 ### JSON overlay (`config.json`)

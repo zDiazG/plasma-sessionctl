@@ -64,6 +64,27 @@ class HelperArguments(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 helper.validate_args(args)
 
+    def test_display_stream_runs_use_only_their_own_profile(self):
+        run = 'a' * 32
+        for stream in (1, 2, 3):
+            args = ['start', f'{run}-s{stream}', 'igpu', 'login_1', 'wayland-1', f'display{stream}']
+            self.assertEqual(helper.validate_args(args)[1], f'{run}-s{stream}')
+        bad = [
+            ['start', run + '-s1', 'igpu', 'login_1', 'wayland-1', 'display2'],
+            ['start', run + '-s1', 'igpu', 'login_1', 'wayland-1', 'performance'],
+            ['start', run, 'igpu', 'login_1', 'wayland-1', 'display1'],
+            ['start', run + '-s0', 'igpu', 'login_1', 'wayland-1', 'display1'],
+            ['start', run + '-s4', 'igpu', 'login_1', 'wayland-1', 'display1'],
+            ['start', run + '-s1;id', 'igpu', 'login_1', 'wayland-1', 'display1'],
+            ['stop', run + '-s1', 'igpu', run + '-s1'],
+        ]
+        for args in bad:
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                helper.validate_args(args)
+        self.assertEqual(helper.validate_args(['status', run + '-s3', 'dgpu'])[1], run + '-s3')
+        self.assertEqual(helper.unit_name(1234, 'igpu', run + '-s2'),
+                         f'plasmactl-sunshine-u1234-igpu@{run}-s2.service')
+
     def test_policy_rejects_unauthorized_uid_and_invalid_role(self):
         with tempfile.TemporaryDirectory() as temporary:
             policy = Path(temporary) / 'policy.json'
@@ -183,6 +204,41 @@ class HelperLifecycle(unittest.TestCase):
         self.assertTrue(self.operate('status', [])['recorded'])
         self.assertFalse(self.operate('stop', ['0' * 32])['recorded'])
         self.assertEqual(self.calls, [])
+
+    def test_display_stream_needs_the_active_primary_run_and_has_its_own_record(self):
+        stream = self.run + '-s1'
+        stream_unit = helper.unit_name(1234, 'igpu', stream)
+        states = {self.unit: {'ActiveState': 'inactive', 'User': '1234'},
+                  stream_unit: dict(self.live)}
+        helper.unit_properties.side_effect = lambda unit: dict(states[unit])
+
+        def manager(argv):
+            self.calls.append(argv)
+            states[stream_unit].update(ActiveState='active' if argv[1] == 'start' else 'inactive',
+                                       InvocationID=self.invocation)
+        helper.command.side_effect = manager
+        with self.assertRaisesRegex(ValueError, 'no active managed Sunshine'):
+            helper.operate(1234, None, {}, 'start', stream, 'igpu', ['2', 'wayland-0', 'display1'])
+        self.assertEqual(self.calls, [])
+        # An active primary unit without its root record is not proof of ownership.
+        states[self.unit] = {'ActiveState': 'active', 'User': '1234', 'InvocationID': self.invocation}
+        with self.assertRaisesRegex(ValueError, 'no active managed Sunshine'):
+            helper.operate(1234, None, {}, 'start', stream, 'igpu', ['2', 'wayland-0', 'display1'])
+        (self.runtime / f'1234-igpu-{self.run}.env').write_text('x')
+        result = helper.operate(1234, None, {}, 'start', stream, 'igpu', ['2', 'wayland-0', 'display1'])
+        self.assertEqual(result['unit'], stream_unit)
+        self.assertEqual(self.calls, [['/usr/bin/systemctl', 'start', '--', stream_unit]])
+        self.assertTrue((self.runtime / f'1234-igpu-{stream}.env').is_file())
+        self.assertTrue((self.runtime / f'1234-igpu-{self.run}.env').is_file())
+        # Stopping the stream leaves the primary record alone.
+        helper.operate(1234, None, {}, 'stop', stream, 'igpu', [self.invocation])
+        self.assertFalse((self.runtime / f'1234-igpu-{stream}.env').exists())
+        self.assertTrue((self.runtime / f'1234-igpu-{self.run}.env').is_file())
+
+    def test_display_profile_resolves_to_a_fixed_config_name(self):
+        self.assertEqual(helper.DISPLAY_PROFILES['display2'], 'plasmactl-display2.conf')
+        self.assertEqual(set(helper.DISPLAY_PROFILES), {'display1', 'display2', 'display3'})
+        self.assertFalse(set(helper.DISPLAY_PROFILES) & set(helper.PROFILES))
 
     def test_active_unit_without_root_record_is_never_adopted(self):
         self.live.update(ActiveState='active', InvocationID=self.invocation)

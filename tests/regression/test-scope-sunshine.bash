@@ -62,6 +62,8 @@ jq -n --arg run "${run}" --arg inv "${inv}" \
       units:{("plasmactl-plasma-"+$run+".scope"):$inv,"plasma-plasmashell.service":$inv},
       sunshine:{role:"igpu",invocation:$inv}}' > "${SCOPE_STATE_FILE}"
 _scope_load() { return 0; }
+# The fixture state has no boot ID; a current-boot record is what this test exercises.
+_scope_stale_boot() { return 1; }
 _scope_match_unit() { return 0; }
 _scope_graph_units() { printf 'plasma-plasmashell.service\n'; }
 _scope_unit() {

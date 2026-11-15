@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Document the Sunshine port map and the firewall requirement for non-default ports.
+- Add `plasmactl display add|remove|list|firewall` for optional extra Moonlight displays on the scope backend: a virtual KWin output plus its own managed Sunshine instance per slot.
+- Refuse `display add` while the primary profile uses KMS capture or has no output name, because KMS maps absolute mouse input over the real connectors only. `DISPLAY_ALLOW_PRIMARY_KMS=true` skips the check.
+- Add a bottom taskbar to extra outputs on add and wait for its removal before stopping the output. Best effort; see the README limits.
+- Re-adopt a plasmashell restarted by systemd when its process still carries the run markers, so `status`, `stop` and `restart` keep working after a shell crash.
+- Re-check the extra output's taskbar after Sunshine is ready and add it again if it was lost.
+- Arrange outputs on add and remove: real outputs at the origin, extra outputs to their right.
+- Extend the restricted Sunshine helper with display stream instances (`<run>-s<slot>`) and fixed `display<slot>` profiles. Reinstall the integration to use them.
+
 ## 0.5.1
 
 - Recover validated execution records from previous boots without signalling current processes.

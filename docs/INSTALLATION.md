@@ -215,6 +215,55 @@ previous states and verify each. Re-enable the package user service only if it
 was enabled before migration. Do not start it automatically merely because it
 was previously enabled but inactive.
 
+## Extra displays
+
+Extra display streams need the helper from this release. Run the preparation and
+inactive installation again after updating the controller, because the helper
+is replaced as one reviewed file. The unit templates and sudoers are unchanged
+in content. Also install `krfb` (for `krfb-virtualmonitor`) and `kscreen-doctor`
+(part of KScreen). After a restart of the managed execution, check:
+
+```bash
+plasmactl display add
+plasmactl display list
+plasmactl display firewall
+```
+
+Set the primary profile to `capture = kwin` and `output_name = <primary output>`
+first (for example `HDMI-A-1`, as `kscreen-doctor -o` reports) and restart the
+execution; KMS capture mis-scales absolute mouse input once a virtual output
+exists. `display add` also adds a bottom taskbar to the new output. It is best effort:
+check it after the add, and remove any orphaned panel in the panel settings if
+plasmashell reports a crash. `display add` refuses to continue unless the primary Sunshine is ready, the
+slot's ports are free and KWin reports the new output. Apply the printed firewall
+rules yourself, then add `<host>:<port>` in Moonlight, pair through the Sunshine
+web UI of that slot, and connect from a second Moonlight window.
+
+## Network ports
+
+Sunshine derives its ports from the configured `port` (default 47989). Offsets
+come from upstream source, so confirm them against the installed version.
+
+| Purpose | Protocol | Port |
+| --- | --- | --- |
+| HTTPS pairing and control | TCP | `port - 5` (47984) |
+| HTTP server info | TCP | `port` (47989) |
+| Web UI | TCP | `port + 1` (47990) |
+| RTSP setup | TCP | `port + 21` (48010) |
+| Video | UDP | `port + 9` (47998) |
+| Control | UDP | `port + 10` (47999) |
+| Audio | UDP | `port + 11` (48000) |
+
+Each extra display stream uses its own block at `DISPLAY_PORT_BASE + 1000 * slot`.
+`plasmactl display firewall` prints the exact rules for the recorded slots.
+`plasmactl` does not change the host firewall. With a default-drop firewall such
+as UFW, allow these ports from the client network only. A listening socket that
+answers `curl` on the host is not reachable until the firewall allows it. A
+Moonlight "serverinfo request timed out" error against a non-default port
+usually means a missing rule, not a Sunshine fault. Compare a request from the
+client with one from the host, and read the firewall log, before changing
+Sunshine settings.
+
 ## Local checks
 
 For the affected bootstrap or privileged installer/helper, run the corresponding
