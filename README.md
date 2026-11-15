@@ -47,6 +47,7 @@ Running a remote streaming desktop with KDE Plasma Wayland and Sunshine on multi
 - The managed Sunshine candidate uses a fixed system service under the desktop UID with a DRM device allowlist. The restriction covers that service and its children.
 - The scope backend records launcher/native-unit identities and stops the recorded Sunshine before desktop teardown. The default legacy backend retains UID-wide process cleanup.
 - Scope starts preserve existing Sunshine profiles and application lists. Explicit profile-generation commands can replace those assets.
+- One stream shows one output. Multi-display streaming is not implemented. An extra Sunshine instance or virtual output started by hand is not owned by `plasmactl`, is not stopped by it, and needs its own ports and firewall rules (see [network ports](docs/INSTALLATION.md#network-ports)).
 - EDID/bootloader operations are separate commands and require a host-specific recovery plan.
 - Legacy GPU diagnostics inspect processes, journals and descriptors. They have not been migrated to the managed Sunshine identity and can be inconclusive.
 

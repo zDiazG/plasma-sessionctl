@@ -29,6 +29,14 @@ UID's managed policy and checks all managed Sunshine services for activity.
 | TTY return/console lock/logout settings | Existing legacy behavior | Not implemented |
 | Automatic fallback on helper failure | Not applicable | None |
 
+Multi-display streaming is not implemented. One Sunshine instance captures one
+output and runs one app at a time, so a second Moonlight window on another
+output needs a second Sunshine instance with its own state, pairing and port
+block. The managed unit name carries one run and role, so a second instance is
+outside the ownership model: `stop` does not signal it, and it has no device
+allowlist unless it is started through a reviewed helper extension. Virtual
+outputs created by other tools are likewise unmanaged.
+
 The retired `setup --system` command returns failure before its former getty,
 shell-profile and sudoers mutations. `setup --user` remains a profile-generation
 command and can replace existing generated profiles/apps.

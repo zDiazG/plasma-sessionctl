@@ -215,6 +215,29 @@ previous states and verify each. Re-enable the package user service only if it
 was enabled before migration. Do not start it automatically merely because it
 was previously enabled but inactive.
 
+## Network ports
+
+Sunshine derives its ports from the configured `port` (default 47989). Offsets
+come from upstream source, so confirm them against the installed version.
+
+| Purpose | Protocol | Port |
+| --- | --- | --- |
+| HTTPS pairing and control | TCP | `port - 5` (47984) |
+| HTTP server info | TCP | `port` (47989) |
+| Web UI | TCP | `port + 1` (47990) |
+| RTSP setup | TCP | `port + 21` (48010) |
+| Video | UDP | `port + 9` (47998) |
+| Control | UDP | `port + 10` (47999) |
+| Audio | UDP | `port + 11` (48000) |
+
+`plasmactl` does not change the host firewall. With a default-drop firewall such
+as UFW, allow these ports from the client network only. A listening socket that
+answers `curl` on the host is not reachable until the firewall allows it. A
+Moonlight "serverinfo request timed out" error against a non-default port
+usually means a missing rule, not a Sunshine fault. Compare a request from the
+client with one from the host, and read the firewall log, before changing
+Sunshine settings.
+
 ## Local checks
 
 For the affected bootstrap or privileged installer/helper, run the corresponding

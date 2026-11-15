@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Document the Sunshine port map and the firewall requirement for non-default ports.
+- Document that multi-display streaming is not implemented and what a second Sunshine instance does not inherit.
+
 ## 0.5.1
 
 - Recover validated execution records from previous boots without signalling current processes.
