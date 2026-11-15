@@ -2259,10 +2259,21 @@ _scope_match_unit() {
     state="$(_scope_property "${properties}" ActiveState)"
     case "${state}" in inactive|failed) return 0 ;; esac
     current="$(_scope_property "${properties}" InvocationID)"
-    [[ "${current}" == "${expected}" && -n "${current}" ]] || {
-        err "Refusing to control a different invocation of ${unit}."
-        return 1
-    }
+    [[ "${current}" == "${expected}" && -n "${current}" ]] && return 0
+    # systemd restarts the shell on its own after a crash. Re-adopt only that
+    # unit, and only while its main process still carries this run's markers.
+    if [[ "${unit}" == plasma-plasmashell.service && "${current}" =~ ^[a-f0-9]{32}$ ]]; then
+        local run pid
+        run="$(jq -r '.run' "${SCOPE_STATE_FILE}")" || return 1
+        pid="$(_scope_property "${properties}" MainPID)"
+        if _scope_pid_owned "${pid}" "${run}"; then
+            _scope_update --arg u "${unit}" --arg i "${current}" '.units[$u] = $i' || return 1
+            log "Re-adopted restarted ${unit} (same run markers)."
+            return 0
+        fi
+    fi
+    err "Refusing to control a different invocation of ${unit}."
+    return 1
 }
 _scope_restore_environment() {
     local current before after key value
@@ -2971,6 +2982,11 @@ _display_add() {
         err "Display ${idx} failed to start; rolling back its own resources."
         _display_teardown "${idx}" || err "Rollback could not prove or stop every display component; state retained for review."
         return 1
+    fi
+    # Starting the capture can make KWin relayout and plasmashell rebuild its
+    # containments, so confirm the taskbar once more now that everything is up.
+    if [[ "$(_display_panel_eval check "$(_display_output_geometry "${wayland}" "Virtual-${name}")" 2>/dev/null || true)" != present ]]; then
+        _display_taskbar add "${wayland}" "Virtual-${name}" || err "The taskbar of Virtual-${name} was lost after startup; add one from the panel settings."
     fi
     port="$(_display_port "${idx}")"
     log "Display ${idx} ready: output Virtual-${name} (${resolution}), Sunshine on port ${port}."

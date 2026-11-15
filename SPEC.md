@@ -221,9 +221,12 @@ keep an orphaned panel after its screen disappears. The controller therefore
 removes the panel before it stops the output, confirms the removal, and refuses
 to stop the output if the removal is not confirmed. After the output stops, it
 removes panels bound to screens that no longer exist. This is best effort: an
-add can lose its panel, and an orphan can survive. A plasmashell restart outside
-the controller changes its invocation, and the scope record then refuses stop and
-restart until the record is refreshed. That refresh is not implemented.
+add can lose its panel, and an orphan can survive. After Sunshine is ready, the
+controller checks the panel once more and re-adds it if it is gone. A plasmashell
+restart outside the controller changes its invocation. Only for
+`plasma-plasmashell.service`, the controller records the new invocation when the
+main process still carries the run's markers (run id, session id, GPU selection);
+every other unit with a changed invocation is refused.
 
 Ports derive from `DISPLAY_PORT_BASE + 1000 * slot`: TCP base-5, base, base+1 and
 base+21; UDP base+9, base+10 and base+11. Add refuses a slot whose ports already

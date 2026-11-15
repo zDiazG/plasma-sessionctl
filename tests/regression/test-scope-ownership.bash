@@ -169,4 +169,17 @@ release_lock
 [[ -f "${LOCK_FILE}" ]] || fail 'release deleted the lock inode'
 flock -n "${LOCK_FILE}" /bin/true || fail 'released lock could not be acquired'
 
+# A shell restarted by systemd is re-adopted only with this run's markers.
+fixture
+jq '.["plasma-plasmashell.service"].inv = "99999999999999999999999999999999"' "${fixture_db}" > "${fixture_db}.new"
+mv "${fixture_db}.new" "${fixture_db}"
+_scope_pid_owned() { return 1; }
+expect_failure _scope_match_unit plasma-plasmashell.service dddddddddddddddddddddddddddddddd
+_scope_pid_owned() { return 0; }
+_scope_match_unit plasma-plasmashell.service dddddddddddddddddddddddddddddddd || fail 'restarted shell was not re-adopted'
+[[ "$(jq -r '.units["plasma-plasmashell.service"]' "${SCOPE_STATE_FILE}")" == 99999999999999999999999999999999 ]] || fail 'shell invocation was not refreshed'
+jq '.["plasma-kwin_wayland.service"].inv = "88888888888888888888888888888888"' "${fixture_db}" > "${fixture_db}.new"
+mv "${fixture_db}.new" "${fixture_db}"
+expect_failure _scope_match_unit plasma-kwin_wayland.service cccccccccccccccccccccccccccccccc
+
 printf 'PASS: scope identity, stale state, invocation reuse, dependency conflicts and bounded stop\n'
