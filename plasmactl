@@ -2753,6 +2753,87 @@ _display_arrange() {
     _display_user_env "WAYLAND_DISPLAY=${wayland}" "${KSCREEN_DOCTOR_BIN}" "${args[@]}" >/dev/null 2>&1
 }
 
+# Taskbar for an extra output. Panels bind to a screen index, so the panel is
+# matched by the output's geometry. Remove it before the output disappears: a
+# panel left on a vanished screen crashed plasmashell (SIGSEGV in KConfigGroup).
+_display_output_geometry() {
+    _display_user_env "WAYLAND_DISPLAY=$1" "${KSCREEN_DOCTOR_BIN}" -j 2>/dev/null |
+        jq -r --arg n "$2" '.outputs[] | select(.name == $n) | "\(.pos.x) \(.pos.y) \(.size.width) \(.size.height)"'
+}
+
+_display_panel_eval() {
+    local action="$1" geom="$2" x y w h
+    read -r x y w h <<< "${geom}"
+    [[ "${x}" =~ ^-?[0-9]+$ && "${y}" =~ ^-?[0-9]+$ && "${w}" =~ ^[0-9]+$ && "${h}" =~ ^[0-9]+$ ]] || return 1
+    local js
+    js="var X=${x},Y=${y},W=${w},H=${h},action='${action}',idx=-1;
+for (var s = 0; s < screenCount; s++) { var g = screenGeometry(s);
+  if (g.x === X && g.y === Y && g.width === W && g.height === H) { idx = s; } }
+if (idx < 0) { print('no-screen'); }
+else if (action === 'check') { print(panels().some(function (p) { return p.screen === idx; }) ? 'present' : 'absent'); }
+else if (action === 'remove') {
+  panels().forEach(function (p) { if (p.screen === idx) { p.remove(); } });
+  print('removed');
+} else if (panels().some(function (p) { return p.screen === idx; })) { print('present'); }
+else {
+  var p = new Panel; p.location = 'bottom'; p.height = 30; p.screen = idx;
+  ['org.kde.plasma.kickoff','org.kde.plasma.pager','org.kde.plasma.icontasks','org.kde.plasma.marginsseparator','org.kde.plasma.systemtray','org.kde.plasma.digitalclock','org.kde.plasma.showdesktop'].forEach(function (t) { p.addWidget(t); });
+  print('added');
+}"
+    _display_user_env qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "${js}"
+}
+
+_display_taskbar() {
+    local action="$1" wayland="$2" name="$3" geom out ticks=0
+    geom="$(_display_output_geometry "${wayland}" "${name}")"
+    [[ -n "${geom}" ]] || return 1
+    if [[ "${action}" == add ]]; then
+        # plasmashell learns about the new screen asynchronously, and KScreen's
+        # arrangement can make it rebuild containments. Add, let the layout
+        # settle, then confirm the panel is still there; add again if it is not.
+        local _attempt
+        for _attempt in 1 2 3; do
+            while (( ticks < 10 )); do
+                out="$(_display_panel_eval add "${geom}" 2>/dev/null || true)"
+                [[ "${out}" == no-screen ]] || break
+                sleep 1; (( ticks += 1 ))
+            done
+            # An orphan from an earlier removal can still be pending in plasmashell
+            # and disappear after this check, taking a new panel with it. Give it
+            # time to settle, then confirm.
+            sleep 8
+            [[ "$(_display_panel_eval check "${geom}" 2>/dev/null || true)" == present ]] && return 0
+            ticks=0
+        done
+        return 1
+    else
+        # Removal takes effect asynchronously. Stopping the output first leaves
+        # an orphaned panel, which crashes plasmashell, so wait until it is gone.
+        out="$(_display_panel_eval remove "${geom}" 2>/dev/null || true)"
+        [[ "${out}" == removed || "${out}" == no-screen ]] || return 1
+        while (( ticks < 20 )); do
+            out="$(_display_panel_eval check "${geom}" 2>/dev/null || true)"
+            [[ "${out}" == absent ]] && return 0
+            sleep 0.5; (( ticks += 1 ))
+        done
+        return 1
+    fi
+}
+
+# Panels bound to a screen index that no longer exists are orphans. Remove them
+# only after the output is gone, which is the state seen to be safe.
+# plasmashell applies the screen change asynchronously and can flag an orphan
+# only after a delay, so run the removal for a fixed window instead of stopping
+# at the first pass that finds nothing.
+_display_remove_orphan_panels() {
+    local ticks=0
+    while (( ticks < 6 )); do
+        _display_user_env qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript \
+            'panels().forEach(function (p) { if (p.screen >= screenCount) { p.remove(); } });' >/dev/null 2>&1 || true
+        sleep 2; (( ticks += 1 ))
+    done
+}
+
 _display_unit_state() {
     local properties
     properties="$(_scope_unit "$1")" || return 1
@@ -2783,6 +2864,9 @@ _display_teardown() {
     case "$(_scope_property "${properties}" ActiveState)" in
         inactive|failed) ;;
         *)
+            _display_taskbar remove "$(jq -r '.wayland // empty' "${SCOPE_STATE_FILE}")" \
+                "$(jq -r --arg i "${idx}" '.displays[$i].output // empty' "${SCOPE_STATE_FILE}")" || {
+                err "Display ${idx} taskbar was not removed; its output stays up to avoid a plasmashell crash. Remove the panel in the panel settings, then retry."; return 1; }
             [[ -n "${output_inv}" && "$(_scope_property "${properties}" InvocationID)" == "${output_inv}" ]] || {
                 err "Display ${idx} output invocation changed or was not recorded; refusing stop."; return 1;
             }
@@ -2796,6 +2880,7 @@ _display_teardown() {
     esac
     _scope_update --arg i "${idx}" 'del(.displays[$i]) | if (.displays|length) == 0 then del(.displays) else . end' || return 1
     _display_arrange "$(jq -r '.wayland // empty' "${SCOPE_STATE_FILE}")" || true
+    _display_remove_orphan_panels
 }
 
 _scope_stop_displays() {
@@ -2858,6 +2943,7 @@ _display_add() {
     done
     (( result != 0 || ticks < WAIT_DISPLAY_OUTPUT * 5 )) || { err "KWin did not report output Virtual-${name}."; result=1; }
     (( result != 0 )) || _display_arrange "${wayland}" || err "Could not arrange the outputs; check the layout in the display settings."
+    (( result != 0 )) || _display_taskbar add "${wayland}" "Virtual-${name}" || err "Could not add a taskbar to Virtual-${name}; add one from the panel settings."
 
     if (( result == 0 )); then
         _scope_sunshine_helper start "${srun}" "${role}" "${sid}" "${wayland}" "display${idx}" >/dev/null || result=$?

@@ -59,6 +59,25 @@ scaled='{"outputs":[{"name":"DP-1","enabled":true,"pos":{"x":0,"y":0},"size":{"w
 [[ "$(_display_layout_args <<< "${scaled}" | tr '\n' ' ')" == 'output.DP-1.position.0,0 output.Virtual-plasmactl-d1.position.1920,0 output.Virtual-plasmactl-d2.position.3840,0 ' ]] || fail 'scaled multi-slot layout wrong'
 [[ -z "$(_display_layout_args <<< '{"outputs":[{"name":"Virtual-plasmactl-d1","pos":{"x":0,"y":0},"size":{"width":10,"height":10},"scale":1}]}')" ]] || fail 'layout without a real output must do nothing'
 
+# Taskbar: the panel script targets the output by geometry, removes before the
+# output goes, and refuses malformed geometry without evaluating anything.
+_display_user_env() { printf '%s\n' "$*" >> "${TEST_HOME}/plasma-calls"; }
+: > "${TEST_HOME}/plasma-calls"
+_display_panel_eval remove '1920 0 1920 1080' >/dev/null || fail 'remove evaluation failed'
+grep -Fq 'p.remove()' "${TEST_HOME}/plasma-calls" || fail 'remove does not delete the panel'
+grep -Fq 'X=1920,Y=0,W=1920,H=1080' "${TEST_HOME}/plasma-calls" || fail 'geometry not passed to the script'
+grep -Fq "action === 'remove'" "${TEST_HOME}/plasma-calls" || fail 'remove branch missing'
+: > "${TEST_HOME}/plasma-calls"
+_display_panel_eval add '1920 0 1920 1080' >/dev/null || fail 'add evaluation failed'
+grep -Fq 'new Panel' "${TEST_HOME}/plasma-calls" || fail 'add does not create a panel'
+grep -Fq "location = 'bottom'" "${TEST_HOME}/plasma-calls" || fail 'panel is not at the bottom'
+: > "${TEST_HOME}/plasma-calls"
+_display_panel_eval check '1920 0 1920 1080' >/dev/null || fail 'check evaluation failed'
+grep -Fq "action === 'check'" "${TEST_HOME}/plasma-calls" || fail 'check action missing'
+: > "${TEST_HOME}/plasma-calls"
+! _display_panel_eval add '1920; id 0 1920 1080' >/dev/null 2>&1 || fail 'malformed geometry accepted'
+[[ ! -s "${TEST_HOME}/plasma-calls" ]] || fail 'malformed geometry reached plasmashell'
+
 # --- stateful fixture -------------------------------------------------------
 out_file="${tmp}/out.state"; calls="${tmp}/calls"
 sun_state() { printf '%s/sun-%s.state\n' "${tmp}" "${1##*-}"; }
@@ -71,7 +90,7 @@ reset_fixture() {
     printf 'inactive\n\n' > "${out_file}"
     rm -f -- "${tmp}"/sun-*.state
     : > "${calls}"
-    fixture_listen=false; fixture_output=true; fixture_helper_start=ok; fixture_krfb=ok
+    fixture_listen=false; fixture_output=true; fixture_taskbar=0; fixture_helper_start=ok; fixture_krfb=ok
 }
 eval "$(declare -f _scope_load | sed '1s/^_scope_load/_real_scope_load/')"
 _scope_load() { return 0; }
@@ -82,6 +101,7 @@ _udp_port_listening() { return 1; }
 _display_adapter() { printf '/dev/dri/by-path/pci-0000:00:02.0-render\n'; }
 command() { [[ "$1" == -v ]] && return 0; builtin command "$@"; }
 _display_arrange() { printf 'arrange %s\n' "$1" >> "${calls}"; }
+_display_taskbar() { printf 'taskbar %s %s %s\n' "$1" "$2" "$3" >> "${calls}"; return "${fixture_taskbar:-0}"; }
 _display_output_present() { [[ "${fixture_output}" == true ]]; }
 _display_user_env() {
     printf 'systemd-run %s\n' "$*" >> "${calls}"
@@ -126,6 +146,7 @@ reset_fixture
 cmd_display add 1 1920x1080 > "${tmp}/add.out" || fail 'add failed'
 grep -Fq -- "--name plasmactl-d1 --resolution 1920x1080" "${calls}" || fail 'virtual output was not requested with its name'
 grep -Fq 'arrange wayland-1' "${calls}" || fail 'outputs were not arranged after creation'
+grep -Fq 'taskbar add wayland-1 Virtual-plasmactl-d1' "${calls}" || fail 'taskbar not added for the new output'
 grep -Fq "helper start ${run}-s1 igpu 2 wayland-1 display1" "${calls}" || fail 'extra Sunshine did not use the stream run and profile'
 [[ "$(jq -r '.displays["1"].sunshine_invocation' "${SCOPE_STATE_FILE}")" == dddddddddddddddddddddddddddddddd ]] || fail 'Sunshine invocation not recorded'
 [[ "$(jq -r '.displays["1"].output_invocation' "${SCOPE_STATE_FILE}")" == cccccccccccccccccccccccccccccccc ]] || fail 'output invocation not recorded'
@@ -180,6 +201,14 @@ reset_fixture; fixture_krfb=fail
 ! cmd_display add 1 1920x1080 >/dev/null 2>&1 || fail 'failed output start accepted'
 ! grep -q '^helper start' "${calls}" || fail 'Sunshine started after output failure'
 [[ "$(displays)" == '{}' ]] || fail 'failed output start left a record'
+
+# A taskbar that cannot be removed keeps its output up: stopping the output
+# would orphan the panel and crash plasmashell.
+reset_fixture; cmd_display add 1 1920x1080 >/dev/null; fixture_taskbar=1; : > "${calls}"
+! cmd_display remove 1 >/dev/null 2>&1 || fail 'output stopped with its taskbar still present'
+! grep -q '^systemctl stop' "${calls}" || fail 'output stopped after a failed taskbar removal'
+[[ "$(jq -r '.displays|keys|length' "${SCOPE_STATE_FILE}")" == 1 ]] || fail 'record dropped after refused removal'
+fixture_taskbar=0
 
 # A failed Sunshine start still stops what it created: Sunshine by identity, then the output.
 reset_fixture; fixture_helper_start=fail

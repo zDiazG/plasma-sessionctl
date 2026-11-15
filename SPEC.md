@@ -215,6 +215,16 @@ therefore requires the primary profile to use `capture = kwin` with a named
 After the output appears, add and remove set the layout: real outputs are
 anchored at the origin and extra outputs follow to their right in slot order.
 
+Each extra output is given a bottom taskbar through plasmashell scripting, placed
+by geometry. Plasmashell applies screen and panel changes asynchronously and can
+keep an orphaned panel after its screen disappears. The controller therefore
+removes the panel before it stops the output, confirms the removal, and refuses
+to stop the output if the removal is not confirmed. After the output stops, it
+removes panels bound to screens that no longer exist. This is best effort: an
+add can lose its panel, and an orphan can survive. A plasmashell restart outside
+the controller changes its invocation, and the scope record then refuses stop and
+restart until the record is refreshed. That refresh is not implemented.
+
 Ports derive from `DISPLAY_PORT_BASE + 1000 * slot`: TCP base-5, base, base+1 and
 base+21; UDP base+9, base+10 and base+11. Add refuses a slot whose ports already
 listen. The generated profile enables LAN encryption mode 1, WAN mode 2, no
