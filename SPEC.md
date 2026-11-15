@@ -207,6 +207,14 @@ matching profile. It starts a stream only while the same run's primary Sunshine 
 active and recorded, and keeps `DevicePolicy=closed` with the same allowlist.
 Validation, naming, record files and stop identity checks are unchanged.
 
+Absolute pointer devices span KWin's whole desktop. The Sunshine KMS backend
+derives its desktop bounds from real DRM connectors only, so a primary stream on
+KMS capture mis-scales absolute mouse input once a virtual output exists. Add
+therefore requires the primary profile to use `capture = kwin` with a named
+`output_name`, and refuses otherwise unless `DISPLAY_ALLOW_PRIMARY_KMS=true`.
+After the output appears, add and remove set the layout: real outputs are
+anchored at the origin and extra outputs follow to their right in slot order.
+
 Ports derive from `DISPLAY_PORT_BASE + 1000 * slot`: TCP base-5, base, base+1 and
 base+21; UDP base+9, base+10 and base+11. Add refuses a slot whose ports already
 listen. The generated profile enables LAN encryption mode 1, WAN mode 2, no
@@ -221,7 +229,7 @@ the rules. Audio is not provided on extra streams: Sunshine instances share the
 user's `sink-sunshine-*` devices and default-sink switching, so per-stream audio
 needs separate evidence. Runtime evidence covers one Intel iGPU host: add, remove,
 restart and re-add, pairing that survives re-adding a slot, and two simultaneous
-1080p60 streams. Frame rate, latency, input mapping on the extra output, per-stream
+1080p60 streams. Frame rate, latency, driving the real client pointer across both windows, per-stream
 audio and the dGPU role are unverified. A controller older than this release does not know the
 `displays` field and will not stop extra displays.
 

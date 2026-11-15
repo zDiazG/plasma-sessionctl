@@ -176,6 +176,7 @@ WAIT_SUNSHINE_PORTS="${WAIT_SUNSHINE_PORTS:-20}"
 DISPLAY_RESOLUTION="${DISPLAY_RESOLUTION:-1920x1080}"
 DISPLAY_PORT_BASE="${DISPLAY_PORT_BASE:-47989}"
 WAIT_DISPLAY_OUTPUT="${WAIT_DISPLAY_OUTPUT:-15}"
+DISPLAY_ALLOW_PRIMARY_KMS="${DISPLAY_ALLOW_PRIMARY_KMS:-false}"
 KRFB_VIRTUALMONITOR_BIN="${KRFB_VIRTUALMONITOR_BIN:-$(command -v krfb-virtualmonitor 2>/dev/null || echo /usr/bin/krfb-virtualmonitor)}"
 KSCREEN_DOCTOR_BIN="${KSCREEN_DOCTOR_BIN:-$(command -v kscreen-doctor 2>/dev/null || echo /usr/bin/kscreen-doctor)}"
 WAIT_KWIN="${WAIT_KWIN:-45}"
@@ -2701,6 +2702,57 @@ _display_sunshine_ready() {
     done
 }
 
+# Absolute pointer input spans KWin's whole desktop. KMS capture only knows real
+# connectors, so a primary stream on KMS maps the pointer over its own output
+# alone and the virtual output shifts it. Capture through KWin sees every output.
+_display_conf_get() {
+    sed -nE "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*\$/\\1/p" "$1" 2>/dev/null | tail -n 1
+}
+
+_display_primary_capture_error() {
+    local profile file capture output
+    profile="$(jq -r '.sunshine.profile // empty' "${SCOPE_STATE_FILE}")"
+    case "${profile}" in
+        normal) file="${SUNSHINE_DEFAULT_CONFIG}" ;;
+        safe) file="${SUNSHINE_SAFE_CONFIG}" ;;
+        performance) file="${SUNSHINE_PERF_CONFIG}" ;;
+        *) printf 'The primary Sunshine profile is unknown.\n'; return 0 ;;
+    esac
+    [[ -f "${file}" ]] || { printf 'The primary Sunshine profile %s is missing.\n' "${file}"; return 0; }
+    capture="$(_display_conf_get "${file}" capture)"; output="$(_display_conf_get "${file}" output_name)"
+    if [[ "${capture}" != kwin ]]; then
+        printf 'The primary profile captures with "%s". Absolute mouse input would be mapped over the primary output only and miss the virtual output. Set capture = kwin and output_name = <primary output> in %s (profiles generated with SUNSHINE_PERF_CAPTURE=kwin do this), restart, and retry.\n' "${capture:-auto}" "${file}"
+    elif [[ -z "${output}" || "${output}" =~ ^[0-9]+$ ]]; then
+        printf 'KWin capture needs output_name set to the primary output name (for example HDMI-A-1) in %s. Without it Sunshine can pick any output, including the virtual one.\n' "${file}"
+    fi
+}
+
+# KScreen remembers positions per output set and can put a new virtual output
+# left of the real desktop. Keep real outputs anchored at the origin and place
+# extra outputs to their right, in slot order. Reads kscreen-doctor -j on stdin.
+_display_layout_args() {
+    jq -r '
+        .outputs as $o
+        | ($o | map(select(.name | startswith("Virtual-plasmactl-d") | not)) | map(select(.enabled != false))) as $real
+        | if ($real | length) == 0 then empty else
+          ($real | map(.pos.x) | min) as $min
+          | ($real | map({name, x: (.pos.x - $min), y: .pos.y, w: ((.size.width / (.scale // 1)) | floor)})) as $r
+          | ($r | map(.x + .w) | max) as $right
+          | ($o | map(select(.name | startswith("Virtual-plasmactl-d"))) | sort_by(.name)) as $e
+          | ($r[] | "output.\(.name).position.\(.x),\(.y)"),
+            (reduce range(0; $e | length) as $i ({x: $right, out: []};
+                .out += ["output.\($e[$i].name).position.\(.x),0"]
+                | .x += (($e[$i].size.width / ($e[$i].scale // 1)) | floor)) | .out[])
+          end'
+}
+
+_display_arrange() {
+    local wayland="$1" args=()
+    mapfile -t args < <(_display_user_env "WAYLAND_DISPLAY=${wayland}" "${KSCREEN_DOCTOR_BIN}" -j 2>/dev/null | _display_layout_args)
+    (( ${#args[@]} > 0 )) || return 1
+    _display_user_env "WAYLAND_DISPLAY=${wayland}" "${KSCREEN_DOCTOR_BIN}" "${args[@]}" >/dev/null 2>&1
+}
+
 _display_unit_state() {
     local properties
     properties="$(_scope_unit "$1")" || return 1
@@ -2742,7 +2794,8 @@ _display_teardown() {
             case "$(_display_unit_state "${unit}")" in inactive|failed) ;; *)
                 err "Display ${idx} output did not stop; state retained."; return 1 ;; esac ;;
     esac
-    _scope_update --arg i "${idx}" 'del(.displays[$i]) | if (.displays|length) == 0 then del(.displays) else . end'
+    _scope_update --arg i "${idx}" 'del(.displays[$i]) | if (.displays|length) == 0 then del(.displays) else . end' || return 1
+    _display_arrange "$(jq -r '.wayland // empty' "${SCOPE_STATE_FILE}")" || true
 }
 
 _scope_stop_displays() {
@@ -2768,6 +2821,10 @@ _display_add() {
         err "krfb-virtualmonitor and kscreen-doctor are required for extra displays."; return 1; }
     info="$(_scope_sunshine_info)" || return 1
     _scope_sunshine_ready "${info}" || { err "The primary managed Sunshine is not ready."; return 1; }
+    if ! _bool_true "${DISPLAY_ALLOW_PRIMARY_KMS}"; then
+        info="$(_display_primary_capture_error)"
+        [[ -z "${info}" ]] || { err "${info}"; return 1; }
+    fi
     for port in $(_display_tcp_ports "${idx}") ; do
         ! _tcp_port_listening "${port}" || { err "TCP port ${port} is already in use; display ${idx} cannot start."; return 1; }
     done
@@ -2800,6 +2857,7 @@ _display_add() {
         sleep 0.2; (( ticks += 1 ))
     done
     (( result != 0 || ticks < WAIT_DISPLAY_OUTPUT * 5 )) || { err "KWin did not report output Virtual-${name}."; result=1; }
+    (( result != 0 )) || _display_arrange "${wayland}" || err "Could not arrange the outputs; check the layout in the display settings."
 
     if (( result == 0 )); then
         _scope_sunshine_helper start "${srun}" "${role}" "${sid}" "${wayland}" "display${idx}" >/dev/null || result=$?

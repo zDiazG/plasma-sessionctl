@@ -52,6 +52,13 @@ rm -- "${conf}"; ln -s /etc/passwd "${conf}"
 ! _display_prepare_config 1 /dev/dri/by-path/pci-0000:00:02.0-render || fail 'symlinked profile accepted'
 rm -- "${conf}"
 
+# Layout: real outputs anchor at the origin, extras follow in slot order.
+bad='{"outputs":[{"name":"Virtual-plasmactl-d1","enabled":null,"pos":{"x":0,"y":0},"size":{"width":1920,"height":1080},"scale":1},{"name":"HDMI-A-1","enabled":true,"pos":{"x":1920,"y":0},"size":{"width":1920,"height":1080},"scale":1}]}'
+[[ "$(_display_layout_args <<< "${bad}" | tr '\n' ' ')" == 'output.HDMI-A-1.position.0,0 output.Virtual-plasmactl-d1.position.1920,0 ' ]] || fail 'swapped layout not corrected'
+scaled='{"outputs":[{"name":"DP-1","enabled":true,"pos":{"x":0,"y":0},"size":{"width":3840,"height":2160},"scale":2},{"name":"Virtual-plasmactl-d2","pos":{"x":0,"y":0},"size":{"width":1280,"height":720},"scale":1},{"name":"Virtual-plasmactl-d1","pos":{"x":9,"y":9},"size":{"width":1920,"height":1080},"scale":1}]}'
+[[ "$(_display_layout_args <<< "${scaled}" | tr '\n' ' ')" == 'output.DP-1.position.0,0 output.Virtual-plasmactl-d1.position.1920,0 output.Virtual-plasmactl-d2.position.3840,0 ' ]] || fail 'scaled multi-slot layout wrong'
+[[ -z "$(_display_layout_args <<< '{"outputs":[{"name":"Virtual-plasmactl-d1","pos":{"x":0,"y":0},"size":{"width":10,"height":10},"scale":1}]}')" ]] || fail 'layout without a real output must do nothing'
+
 # --- stateful fixture -------------------------------------------------------
 out_file="${tmp}/out.state"; calls="${tmp}/calls"
 sun_state() { printf '%s/sun-%s.state\n' "${tmp}" "${1##*-}"; }
@@ -59,6 +66,8 @@ reset_fixture() {
     jq -n --arg run "${run}" --arg inv "${primary_inv}" \
         '{schema:1,phase:"running",run:$run,sid:"2",wayland:"wayland-1",gpu:"/dev/dri/card1",
           sunshine:{role:"igpu",profile:"performance",display:"wayland-1",invocation:$inv}}' > "${SCOPE_STATE_FILE}"
+    SUNSHINE_PERF_CONFIG="${tmp}/primary.conf"
+    printf 'min_log_level = info\ncapture = kwin\noutput_name = HDMI-A-1\n' > "${SUNSHINE_PERF_CONFIG}"
     printf 'inactive\n\n' > "${out_file}"
     rm -f -- "${tmp}"/sun-*.state
     : > "${calls}"
@@ -72,6 +81,7 @@ _tcp_port_listening() { [[ "${fixture_listen}" == true ]]; }
 _udp_port_listening() { return 1; }
 _display_adapter() { printf '/dev/dri/by-path/pci-0000:00:02.0-render\n'; }
 command() { [[ "$1" == -v ]] && return 0; builtin command "$@"; }
+_display_arrange() { printf 'arrange %s\n' "$1" >> "${calls}"; }
 _display_output_present() { [[ "${fixture_output}" == true ]]; }
 _display_user_env() {
     printf 'systemd-run %s\n' "$*" >> "${calls}"
@@ -115,6 +125,7 @@ displays() { jq -c '.displays // {}' "${SCOPE_STATE_FILE}"; }
 reset_fixture
 cmd_display add 1 1920x1080 > "${tmp}/add.out" || fail 'add failed'
 grep -Fq -- "--name plasmactl-d1 --resolution 1920x1080" "${calls}" || fail 'virtual output was not requested with its name'
+grep -Fq 'arrange wayland-1' "${calls}" || fail 'outputs were not arranged after creation'
 grep -Fq "helper start ${run}-s1 igpu 2 wayland-1 display1" "${calls}" || fail 'extra Sunshine did not use the stream run and profile'
 [[ "$(jq -r '.displays["1"].sunshine_invocation' "${SCOPE_STATE_FILE}")" == dddddddddddddddddddddddddddddddd ]] || fail 'Sunshine invocation not recorded'
 [[ "$(jq -r '.displays["1"].output_invocation' "${SCOPE_STATE_FILE}")" == cccccccccccccccccccccccccccccccc ]] || fail 'output invocation not recorded'
@@ -141,6 +152,21 @@ order="$(grep -nE '^(helper stop|systemctl stop)' "${calls}" | cut -d: -f2 | cut
 [[ "${order}" == 'helper stop,systemctl stop,' ]] || fail "stop order was: ${order}"
 [[ "$(displays)" == '{}' ]] || fail 'removed stream still recorded'
 jq -e '.sunshine.invocation == "'"${primary_inv}"'"' "${SCOPE_STATE_FILE}" >/dev/null || fail 'primary record changed'
+
+# Absolute pointer input needs a primary stream that sees every output.
+reset_fixture; printf 'capture = kms\noutput_name = HDMI-A-1\n' > "${SUNSHINE_PERF_CONFIG}"
+! cmd_display add 1 1920x1080 >/dev/null 2>&1 || fail 'KMS primary capture accepted'
+grep -Fq 'captures with "kms"' "${TEST_HOME}/errors" || fail 'KMS refusal does not explain the cause'
+! grep -Eq '^(systemd-run|helper start|systemctl)' "${calls}" || fail 'KMS refusal created resources'
+printf 'min_log_level = info\n' > "${SUNSHINE_PERF_CONFIG}"
+! cmd_display add 1 1920x1080 >/dev/null 2>&1 || fail 'primary without a capture setting accepted'
+printf 'capture = kwin\n' > "${SUNSHINE_PERF_CONFIG}"
+! cmd_display add 1 1920x1080 >/dev/null 2>&1 || fail 'KWin capture without an output name accepted'
+printf 'capture = kwin\noutput_name = 0\n' > "${SUNSHINE_PERF_CONFIG}"
+! cmd_display add 1 1920x1080 >/dev/null 2>&1 || fail 'numeric output index accepted for KWin capture'
+printf 'capture = kms\n' > "${SUNSHINE_PERF_CONFIG}"
+DISPLAY_ALLOW_PRIMARY_KMS=true cmd_display add 1 1920x1080 >/dev/null || fail 'explicit KMS override refused'
+reset_fixture
 
 # Output that KWin never reports: nothing else starts, and the record is rolled back.
 reset_fixture; fixture_output=false

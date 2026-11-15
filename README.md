@@ -264,6 +264,9 @@ Each slot uses its own port block (`DISPLAY_PORT_BASE + 1000 * slot`; slot 1 is
 `~/.config/sunshine/plasmactl-display<N>.conf` that is never overwritten. The
 helper keeps the same device allowlist as the primary service. Limits:
 
+- The primary profile must capture through KWin: `capture = kwin` and `output_name = <primary output>` (for example `HDMI-A-1`). KMS capture only knows real connectors, so it maps absolute mouse input over the primary output alone, while KWin spreads an absolute pointer over the whole extended desktop. With KMS the cursor lands on the virtual output from about the middle of the primary window. `display add` refuses to continue until the profile is fixed; `DISPLAY_ALLOW_PRIMARY_KMS=true` skips the check. Edit the profile by hand, because `plasmactl` never rewrites an existing one.
+- `display add` also arranges the outputs: real outputs start at 0,0 and extra outputs follow to their right in slot order, because KScreen can otherwise place the new output on the left.
+- In Moonlight's absolute (remote desktop) mouse mode each window controls only its own output, so the pointer cannot cross from one window to the other. To cross, switch the window to relative (game) mouse mode and capture the pointer, or move windows with the keyboard (Meta+Shift+Arrow).
 - Extra streams carry no audio (`stream_audio = disabled`); the primary stream keeps it.
 - The Sunshine web UI of each stream asks for its own first username and password.
 - Run `display firewall` and open the ports from the client network only.
@@ -368,6 +371,7 @@ SUNSHINE_SYSTEMD_ASSERT_MODE=journal
 
 # Extra displays (scope backend)
 DISPLAY_RESOLUTION=1920x1080          # default size for display add
+DISPLAY_ALLOW_PRIMARY_KMS=false        # true skips the primary capture check
 DISPLAY_PORT_BASE=47989               # primary Sunshine port; slot N uses base + 1000 * N
 WAIT_DISPLAY_OUTPUT=15                # seconds to wait for KWin to report the output
 KRFB_VIRTUALMONITOR_BIN=/usr/bin/krfb-virtualmonitor

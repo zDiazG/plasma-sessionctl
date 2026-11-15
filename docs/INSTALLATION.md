@@ -229,7 +229,10 @@ plasmactl display list
 plasmactl display firewall
 ```
 
-`display add` refuses to continue unless the primary Sunshine is ready, the
+Set the primary profile to `capture = kwin` and `output_name = <primary output>`
+first (for example `HDMI-A-1`, as `kscreen-doctor -o` reports) and restart the
+execution; KMS capture mis-scales absolute mouse input once a virtual output
+exists. `display add` refuses to continue unless the primary Sunshine is ready, the
 slot's ports are free and KWin reports the new output. Apply the printed firewall
 rules yourself, then add `<host>:<port>` in Moonlight, pair through the Sunshine
 web UI of that slot, and connect from a second Moonlight window.
